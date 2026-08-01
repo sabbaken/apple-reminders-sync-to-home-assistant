@@ -51,6 +51,15 @@ A single unit test, any of these:
 `make` re-mints one on every target; run the script on its own and it fails with
 a confusing 401. Go through `make e2e`, or `make ha-token` first.
 
+The installer, against this checkout instead of GitHub. Point it away from
+`~/.local/bin` and the real config, and pre-seed an `exclude` — auto mode would
+otherwise pair up every real list on the machine:
+
+```bash
+RHS_BASE_URL="file://$PWD" RHS_BIN_DIR=/tmp/rhs-bin RHS_CONFIG=/tmp/rhs.json \
+  ./install.sh --yes --no-install --url http://127.0.0.1:8124 --token "$(make ha-token)"
+```
+
 ## Layout
 
 ```
@@ -64,7 +73,9 @@ reminders_ha_sync.py     everything, in banner-commented sections — grep for t
                            execution                 execute_plan — all the I/O
                            pairing lists             resolve_pairs
                            commands                  sync/run/doctor/lists/install/uninstall
+                           guided setup              cmd_setup and its prompts
                            entry point               argparse + logging setup
+install.sh               what the README one-liner runs: brew, download, hand off to `setup`
 config.example.json      the whole config: url + token
 config.full-example.json every option with its default
 tests/test_merge.py      the pure layers, with FakeReminders/FakeHa for pairing
@@ -156,25 +167,40 @@ reminders. Everything here follows:
     is exactly what reminders-cli emits — so `parse_iso` exists. No `match`, no
     3.10+ stdlib.
 
+### Installed-in-the-wild concerns
+
+19. **The shebang is `#!/usr/bin/python3`, not `env python3`.** With pyenv on
+    PATH, `env python3` picks a shim, and `launchd_python()` exists so the plist
+    names the absolute system interpreter regardless. A shim in the plist needs a
+    PATH launchd does not provide, and the agent would fail silently every run.
+    The code stays 3.9-compatible so this is always a safe pin.
+20. **`setup` runs before a config exists**, so `main` dispatches it (and
+    `uninstall`) before `load_config`. It must never require one.
+21. **Prompts read `/dev/tty`, not stdin.** The installer can arrive down a pipe.
+    `ask` opens the tty directly and `getpass` already does.
+22. **The installer asks for the Reminders permission itself**, before handing
+    over to `setup`. The dialog only appears for a process in the user's GUI
+    session — which the installer is and a LaunchAgent is not.
+
 ### Pairing
 
-19. **Names are matched with `casefold`, not `lower`.** The lists are named in
+23. **Names are matched with `casefold`, not `lower`.** The lists are named in
     Russian; `lower` is not the right fold for non-ASCII.
-20. **Home Assistant transliterates a list name into its internal key**, so
+24. **Home Assistant transliterates a list name into its internal key**, so
     `Тест` and `Test` both want `test` and the second cannot be created. This is
     reported as a problem, never guessed around. Two Home Assistant lists
     sharing a name are likewise reported, not resolved.
-21. **An excluded list must not come back through the reverse direction.**
+25. **An excluded list must not come back through the reverse direction.**
     `resolve_pairs` skips any Home Assistant name already present in Reminders,
     excluded or not, before considering whether to create a Reminders list.
-22. **Creating a Home Assistant list needs an admin token**, because to-do
+26. **Creating a Home Assistant list needs an admin token**, because to-do
     entities come from config entries. `create_local_todo` walks the same config
     flow the UI walks, then finds the entity by friendly name — the entity id is
     a transliterated slug and must not be guessed.
-23. **Title adoption is what makes losing `state.json` survivable.** Unlinked
+27. **Title adoption is what makes losing `state.json` survivable.** Unlinked
     items with the same title are paired rather than duplicated, then merged by
     the ordinary rules with an empty `last`.
-24. **`max_deletes_per_run` is a bad-read guard.** A transient failure should
+28. **`max_deletes_per_run` is a bad-read guard.** A transient failure should
     not be able to empty both sides; exceeding it fails the pair and asks for
     `--force`.
 

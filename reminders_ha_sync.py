@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Two-way sync between macOS Reminders and Home Assistant to-do lists.
 
 Single file, standard library only, so it runs under /usr/bin/python3 with no
@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import getpass
 import json
 import logging
 import logging.handlers
@@ -483,8 +484,9 @@ class HomeAssistant:
             detail = exc.read().decode("utf-8", "replace").strip()
             if exc.code == 401:
                 raise UserError(
-                    "Home Assistant rejected the token (401). Create a new "
-                    "long-lived access token and put it in the config."
+                    "Home Assistant rejected the token (401) -- it may have been "
+                    "deleted, or belong to a different instance. Create a new "
+                    "long-lived access token in your profile, under Security."
                 ) from None
             raise UserError(
                 "Home Assistant returned %d for %s %s: %s"
@@ -501,6 +503,18 @@ class HomeAssistant:
     def ping(self) -> str:
         result = self._request("GET", "/api/")
         return (result or {}).get("message", "")
+
+    def is_admin(self) -> bool:
+        """Whether this token may create config entries, i.e. to-do lists.
+
+        There is no "am I an admin" endpoint, so this asks for something only an
+        administrator can read.
+        """
+        try:
+            self._request("GET", "/api/config/config_entries/entry?domain=local_todo")
+            return True
+        except UserError:
+            return False
 
     def state(self, entity_id: str) -> Optional[dict]:
         try:
@@ -1591,6 +1605,255 @@ def launch_agent_path() -> str:
     return expand("~/Library/LaunchAgents/%s.plist" % LAUNCH_LABEL)
 
 
+# --------------------------------------------------------------------------- #
+# guided setup
+# --------------------------------------------------------------------------- #
+
+
+def ask(question: str, default: str = "") -> str:
+    """Read one answer from the terminal.
+
+    Reads /dev/tty rather than stdin so this still works when the installer
+    arrives down a pipe, which is how `curl | bash` ends up running it.
+    """
+    suffix = " [%s]: " % default if default else ": "
+    try:
+        with open("/dev/tty", "r+") as tty:
+            tty.write(question + suffix)
+            tty.flush()
+            answer = tty.readline().strip()
+    except OSError:
+        answer = input(question + suffix).strip()
+    return answer or default
+
+
+def ask_secret(question: str) -> str:
+    # getpass already reads the terminal directly rather than stdin, which is
+    # what makes it work under `curl | bash`.
+    return getpass.getpass(question + ": ").strip()
+
+
+def confirm(question: str, default: bool = True) -> bool:
+    hint = "Y/n" if default else "y/N"
+    while True:
+        answer = ask("%s (%s)" % (question, hint)).lower()
+        if not answer:
+            return default
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("n", "no"):
+            return False
+
+
+def wait_for_reminders_access(reminders: Reminders) -> List[str]:
+    """Return the list names, walking the user through the grant if needed."""
+    while True:
+        try:
+            return reminders.lists()
+        except UserError as exc:
+            if "access has not been granted" not in str(exc):
+                raise
+            print()
+            print("macOS has not granted Reminders access to:")
+            print("    %s" % reminders.binary)
+            print()
+            print("Run this in a terminal window you opened yourself, and click")
+            print("Allow when the dialog appears:")
+            print()
+            print("    %s show-lists" % reminders.binary)
+            print()
+            print("If no dialog appears, switch it on under System Settings ->")
+            print("Privacy & Security -> Reminders.")
+            print()
+            if not confirm("Granted it? Check again"):
+                raise UserError(
+                    "Reminders access is required. Re-run `%s setup` once it is "
+                    "granted." % os.path.basename(SCRIPT_PATH)
+                ) from None
+
+
+def cmd_setup(config_path: str, args: argparse.Namespace) -> int:
+    """Ask the handful of questions a working config needs, then install."""
+    full_path = expand(config_path)
+    existing: Dict[str, object] = {}
+    if os.path.exists(full_path):
+        try:
+            with open(full_path, encoding="utf-8") as fh:
+                existing = json.load(fh)
+        except (json.JSONDecodeError, OSError):
+            existing = {}
+    previous = existing.get("home_assistant") or {}
+
+    print("Setting up the Reminders <-> Home Assistant sync.")
+    print("Config will be written to %s" % full_path)
+    print()
+
+    reminders = Reminders(args.reminders_binary)
+    if args.yes:
+        r_lists = reminders.lists()
+    else:
+        r_lists = wait_for_reminders_access(reminders)
+    print("Reminders: %d lists (%s)" % (len(r_lists), ", ".join(r_lists)))
+    print()
+
+    # -- Home Assistant ---------------------------------------------------- #
+
+    url = args.url or ""
+    token = args.token or os.environ.get("RHS_HA_TOKEN") or ""
+    ha: Optional[HomeAssistant] = None
+
+    while ha is None:
+        if not url:
+            url = ask(
+                "Home Assistant address",
+                str(previous.get("url") or "http://homeassistant.local:8123"),
+            )
+        if not url.startswith(("http://", "https://")):
+            url = "http://" + url
+        if not token:
+            print("Profile -> Security -> Long-lived access tokens -> Create Token.")
+            print("Use an administrator account, so lists can be created for you.")
+            print("(the paste stays hidden)")
+            token = ask_secret("Token")
+
+        candidate = HomeAssistant(url.rstrip("/"), token)
+        try:
+            candidate.ping()
+        except UserError as exc:
+            print()
+            print("! %s" % exc)
+            print()
+            if args.yes:
+                return 2
+            if "rejected the token" in str(exc):
+                token = ""
+            else:
+                url = ""
+            continue
+        ha = candidate
+
+    print("Home Assistant: reachable at %s" % url)
+    if not ha.is_admin():
+        print()
+        print("! This token cannot create to-do lists -- it does not belong to an")
+        print("  administrator. Lists that already exist will still sync; missing")
+        print("  ones will be reported instead of created.")
+        print()
+        if not args.yes and not confirm("Carry on with this token", default=False):
+            return 2
+    print()
+
+    # -- write the config -------------------------------------------------- #
+
+    raw = dict(existing)
+    raw["home_assistant"] = dict(previous, url=url.rstrip("/"), token=token)
+    write_config(full_path, raw)
+
+    # -- show the plan, offer to trim it ----------------------------------- #
+
+    config = Config(raw, full_path)
+    pairing = resolve_pairs(config, reminders, ha, create=False)
+    # Only rows that would actually be synced can be opted out of, so those are
+    # the ones that get numbers.
+    choices = [row for row in pairing.plan if row[2] != "excluded"]
+    skipped = [row for row in pairing.plan if row[2] == "excluded"]
+
+    if choices:
+        print("Here is what a sync would do:")
+        print()
+        for index, (list_name, entity_id, note) in enumerate(choices, 1):
+            print("  %2d. %-26s %-26s %s" % (index, list_name, entity_id, note))
+        if skipped:
+            print()
+            print("  already excluded: %s" % ", ".join(row[0] if row[0] != "-" else row[1] for row in skipped))
+        print()
+
+        if not args.yes:
+            answer = ask("Numbers to leave out (comma-separated, Enter to sync all)")
+            excluded = []
+            for chunk in answer.replace(" ", "").split(","):
+                if not chunk:
+                    continue
+                try:
+                    index = int(chunk)
+                except ValueError:
+                    print("! ignoring %r, that is not a number" % chunk)
+                    continue
+                if not 1 <= index <= len(choices):
+                    print("! ignoring %d, out of range" % index)
+                    continue
+                list_name, entity_id, _ = choices[index - 1]
+                excluded.append(list_name if list_name != "-" else entity_id)
+            if excluded:
+                raw["exclude"] = sorted(set(list(raw.get("exclude") or []) + excluded))
+                write_config(full_path, raw)
+                config = Config(raw, full_path)
+                print("Excluded: %s" % ", ".join(excluded))
+            print()
+    else:
+        print("Nothing to sync: every list is excluded.")
+        print()
+
+    for problem in pairing.problems:
+        print("! %s" % problem)
+
+    # -- background it ----------------------------------------------------- #
+
+    interval = args.interval
+    if not args.yes:
+        interval = int(ask("Sync every how many seconds", str(interval)) or interval)
+
+    if args.no_install:
+        print("Syncing once, without installing the LaunchAgent...")
+        result = sync_once(config)
+        print()
+        print("Sync from now on with:")
+        print("    %s sync" % SCRIPT_PATH)
+        return result
+
+    if not args.yes and not confirm("Sync now and start syncing every %ds" % interval):
+        print()
+        print("Nothing installed. When you are ready:")
+        print("    %s install --interval %d" % (SCRIPT_PATH, interval))
+        return 0
+
+    print()
+    result = cmd_install(config, interval)
+    if result == 0:
+        print()
+        print("Done. Check on it any time with:")
+        print("    %s doctor" % SCRIPT_PATH)
+    return result
+
+
+def write_config(path: str, raw: dict) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(raw, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+    os.chmod(path, 0o600)
+
+
+def launchd_python() -> str:
+    """The interpreter to name in the plist.
+
+    Prefer the one macOS ships: the script is stdlib-only and 3.9-compatible, so
+    it always works, and it is an absolute path that exists no matter what PATH
+    launchd hands the job. A pyenv shim -- which is what `sys.executable` is
+    under a pyenv shell -- needs a PATH launchd does not provide, and the agent
+    would fail silently every run.
+    """
+    system = "/usr/bin/python3"
+    if os.access(system, os.X_OK):
+        return system
+    LOG.warning(
+        "%s is missing; the LaunchAgent will use %s, which must stay available",
+        system,
+        sys.executable,
+    )
+    return sys.executable
+
+
 def cmd_install(config: Config, interval: int, initial_sync: bool = True) -> int:
     # Seed in the foreground before handing over to launchd. In auto mode the
     # first run can create a lot of lists, and watching it happen beats
@@ -1611,7 +1874,7 @@ def cmd_install(config: Config, interval: int, initial_sync: bool = True) -> int
     plist = {
         "Label": LAUNCH_LABEL,
         "ProgramArguments": [
-            sys.executable,
+            launchd_python(),
             SCRIPT_PATH,
             "--config",
             config.path,
@@ -1721,6 +1984,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = parser.add_subparsers(dest="command")
 
+    setup = sub.add_parser(
+        "setup", help="guided first-time setup: asks, verifies, installs"
+    )
+    setup.add_argument("--url", help="skip the question and use this address")
+    setup.add_argument("--token", help="skip the question and use this token")
+    setup.add_argument("--interval", type=int, default=600, help="seconds between syncs")
+    setup.add_argument(
+        "--reminders-binary", help="path to the `reminders` binary, if it is not on PATH"
+    )
+    setup.add_argument(
+        "--no-install", action="store_true", help="configure and sync, but no LaunchAgent"
+    )
+    setup.add_argument(
+        "--yes", "-y", action="store_true", help="ask nothing; fail instead of prompting"
+    )
+
     sync = sub.add_parser("sync", help="sync once and exit")
     sync.add_argument("--dry-run", action="store_true", help="only print what would change")
     sync.add_argument(
@@ -1753,9 +2032,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     command = args.command or "sync"
 
+    # These two run before a config exists, so they cannot load one.
     if command == "uninstall":
         setup_logging("info", None)
         return cmd_uninstall()
+
+    if command == "setup":
+        setup_logging("debug" if args.verbose else "info", None)
+        try:
+            return cmd_setup(args.config, args)
+        except UserError as exc:
+            LOG.error("%s", exc)
+            return 2
+        except KeyboardInterrupt:
+            print()
+            return 130
 
     try:
         config = load_config(args.config)

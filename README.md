@@ -1,99 +1,137 @@
 # apple-reminders-sync-to-home-assistant
 
-Two-way sync between macOS Reminders and Home Assistant to-do lists.
+Two-way sync between the Reminders app on your Mac and Home Assistant's to-do
+lists. Tick something off on your iPhone and it is ticked off in Home Assistant;
+add something from an automation and it turns up in Reminders.
 
-One stdlib-only Python file that runs under the `/usr/bin/python3` already on
-your Mac, driven by launchd every few minutes. The Reminders side goes through
-[keith/reminders-cli](https://github.com/keith/reminders-cli); Home Assistant is
-reached over its REST API with a long-lived token.
+One small Python script that runs on the Mac every few minutes in the
+background. Your lists are paired up by name and the missing ones created on
+both sides, so there is nothing to configure beyond a token.
+
+## Install
+
+**First, get a token.** This is the only thing you have to prepare, and it lives
+in the Home Assistant web interface:
+
+1. Click your name, bottom left of the sidebar.
+2. Open the **Security** tab.
+3. Scroll to **Long-lived access tokens** → **Create token**, give it any name.
+4. Copy it. Home Assistant shows it once.
+
+Use an **administrator** account. Creating a to-do list means creating a config
+entry, which only an administrator may do. A non-admin token still syncs lists
+that already exist.
+
+**Then run this on the Mac whose Reminders you want to sync:**
+
+```sh
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/sabbaken/apple-reminders-sync-to-home-assistant/main/install.sh)"
+```
+
+It walks through the rest:
+
+1. Installs `reminders-cli` with Homebrew, if it is not already there. (This is
+   what actually talks to the Reminders app.)
+2. Asks macOS for permission to read your Reminders — **click Allow**.
+3. Puts the sync script in `~/.local/bin/reminders-ha-sync`.
+4. Asks for your Home Assistant address and that token, and checks both work
+   before writing anything.
+5. Shows you which lists it is about to sync and lets you drop any of them.
+6. Syncs once while you watch, then keeps syncing every 10 minutes.
+
+Nothing needs `sudo`, and nothing is written outside your home directory.
+
+<details>
+<summary>What it looks like</summary>
 
 ```
-reminders_ha_sync.py       the whole thing
-config.example.json        the whole config: a URL and a token
-config.full-example.json   every option, with its default
-docker-compose.yml + dev/  throwaway HA on :8124 for testing
-tests/test_merge.py        merge-engine and pairing unit tests (nothing live)
-tests/e2e.py               real round trips against the dev HA
+Found reminders-cli at /opt/homebrew/bin/reminders
+Downloading the sync script to /Users/you/.local/bin/reminders-ha-sync
+
+Setting up the Reminders <-> Home Assistant sync.
+Config will be written to /Users/you/.config/reminders-ha-sync/config.json
+
+Reminders: 3 lists (Покупки, Личное, Movies)
+
+Home Assistant address [http://homeassistant.local:8123]:
+Profile -> Security -> Long-lived access tokens -> Create Token.
+Use an administrator account, so lists can be created for you.
+(the paste stays hidden)
+Token:
+Home Assistant: reachable at http://homeassistant.local:8123
+
+Here is what a sync would do:
+
+   1. Покупки                    todo.pokupki               paired
+   2. Личное                     -                          would create in Home Assistant
+   3. Movies                     -                          would create in Home Assistant
+   4. Shopping List              todo.shopping_list         would create in Reminders
+
+Numbers to leave out (comma-separated, Enter to sync all): 3,4
+Excluded: Movies, Shopping List
+
+Sync every how many seconds [600]:
+Sync now and start syncing every 600s (Y/n):
+
+running the first sync...
+HA +12 ~0 -0 | Reminders +0 ~0 -0 | failures 0
+
+installed /Users/you/Library/LaunchAgents/com.github.keith-reminders-ha-sync.plist
+syncing every 600 seconds; log: /Users/you/Library/Logs/reminders-ha-sync.log
+
+Done. Check on it any time with:
+    /Users/you/.local/bin/reminders-ha-sync doctor
 ```
 
-## Setup
+</details>
 
-There are two things to do by hand: grant a permission, and paste a token.
-Everything else — pairing the lists up, creating the ones that are missing —
-happens on the first run.
+### Rather not pipe a script into bash
 
-**1. Install the CLI and grant it access.**
+Fair. The installer does nothing you cannot do yourself:
 
 ```sh
 brew install keith/formulae/reminders-cli
-reminders show-lists          # run this in Terminal.app and click Allow
+reminders show-lists                      # click Allow
+
+mkdir -p ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/sabbaken/apple-reminders-sync-to-home-assistant/main/reminders_ha_sync.py \
+  -o ~/.local/bin/reminders-ha-sync
+chmod 755 ~/.local/bin/reminders-ha-sync
+
+~/.local/bin/reminders-ha-sync setup
 ```
 
-The permission dialog only appears for a process running in your GUI session, so
-this first run has to happen in a terminal you opened yourself. Until it
-succeeds every command prints `error: you need to grant reminders access`.
+## Everyday use
 
-**2. Paste a token.**
-
-Home Assistant → your profile → Security → Long-lived access tokens → Create. It
-has to belong to an **administrator** account, because creating a to-do list
-means creating a config entry.
+`~/.local/bin` is often not on `PATH`, so these use the full path. Add the
+directory to your `PATH` if you would rather not.
 
 ```sh
-mkdir -p ~/.config/reminders-ha-sync
-cp config.example.json ~/.config/reminders-ha-sync/config.json
-chmod 600 ~/.config/reminders-ha-sync/config.json
-$EDITOR ~/.config/reminders-ha-sync/config.json    # url + token, that is all
+~/.local/bin/reminders-ha-sync doctor          # is everything healthy, and what pairs with what
+~/.local/bin/reminders-ha-sync sync --dry-run  # what would change, without changing it
+~/.local/bin/reminders-ha-sync sync            # sync now
+~/.local/bin/reminders-ha-sync setup           # change the address, token or list selection
+~/.local/bin/reminders-ha-sync uninstall       # stop syncing
 ```
 
-**3. Look at what it is about to do.**
+Syncs happen every 10 minutes, plus one at login. The log is
+`~/Library/Logs/reminders-ha-sync.log`, rotated at 2 MB. To sync more or less
+often, `install --interval 300`.
 
-```sh
-./reminders_ha_sync.py doctor
-```
+**Update** by re-running the installer: it overwrites the script and keeps your
+config. **Uninstall** with `uninstall`, then delete
+`~/.local/bin/reminders-ha-sync` and `~/.config/reminders-ha-sync/`. Nothing is
+deleted from either Reminders or Home Assistant.
 
-`doctor` prints the pairing table without changing anything:
-
-```
-lists       matched by name
-  Список Покупок               -                    would create in Home Assistant
-  Личные Покупки               -                    would create in Home Assistant
-  Movies                       -                    would create in Home Assistant
-  Покупки                      todo.pokupki         paired
-  Shopping List                todo.shopping_list   would create in Reminders
-```
-
-Anything you would rather it left alone goes in `exclude` — by Reminders list
-name, by Home Assistant name, or by entity id:
-
-```json
-{ "exclude": ["Movies", "todo.shopping_list"] }
-```
-
-**4. Put it in the background.**
-
-```sh
-./reminders_ha_sync.py install --interval 600
-```
-
-`install` runs the first sync in the foreground and prints what it did, then
-writes `~/Library/LaunchAgents/com.github.keith-reminders-ha-sync.plist` and
-loads it: a sync every 10 minutes, plus one at login. If that first sync
-reports problems, nothing is loaded — the initial run is the one worth watching,
-since it creates the lists and seeds them. `--skip-initial-sync` opts out.
-
-Logs go to `~/Library/Logs/reminders-ha-sync.log` (rotated at 2 MB).
-`uninstall` reverses it. `run --interval 600` is the foreground alternative if
-you would rather not use launchd.
-
-If the LaunchAgent's syncs fail with a permission error while the same command
-works from your terminal, macOS is treating the launchd job as a separate
-requester. Running `reminders show-lists` in Terminal once more, and keeping the
-binary at its Homebrew path, is what clears it — the grant is keyed to that path.
+If the background syncs fail with a permission error while the same command
+works when you type it, macOS is treating the LaunchAgent as a separate
+requester. Run `reminders show-lists` in Terminal once more; the grant is keyed
+to the binary's path, so keep it where Homebrew put it.
 
 ## Config
 
-Only `home_assistant.url` and `home_assistant.token` are required.
+`~/.config/reminders-ha-sync/config.json`. `setup` writes it, and it is plain
+JSON if you would rather edit it. Only the address and token are required.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -113,6 +151,8 @@ Only `home_assistant.url` and `home_assistant.token` are required.
 | `state_file` | `~/.local/state/reminders-ha-sync/state.json` | |
 | `log_file` | `~/Library/Logs/reminders-ha-sync.log` | |
 | `reminders_binary` | auto | Override the `reminders` path |
+
+`config.full-example.json` has all of it with the defaults filled in.
 
 ### How lists get paired
 
@@ -198,6 +238,12 @@ reads and writes only title, notes, due date and completion.
 **Deleting a list is manual.** The CLI cannot remove one, so a list created by
 mistake has to go from Reminders.app. Adding it to `exclude` stops it syncing.
 
+**All-day vs timed.** A reminder due at exactly 00:00 is indistinguishable from
+an all-day one in the CLI's output, so it round-trips as all-day.
+
+**Timezones.** Due datetimes are sent with an explicit UTC offset, so the Mac
+and Home Assistant disagreeing about timezone cannot shift them.
+
 ### Why not EventKit directly
 
 Talking to EventKit through PyObjC would close the due-date gap and make
@@ -212,19 +258,23 @@ Both trade a rare limitation for a worse install.
 If it ever becomes worth it, the `Reminders` class is the only thing that would
 change: seven methods, and the merge engine knows nothing about it.
 
-**All-day vs timed.** A reminder due at exactly 00:00 is indistinguishable from
-an all-day one in the CLI's output, so it round-trips as all-day.
-
-**Timezones.** Due datetimes are sent with an explicit UTC offset, so the Mac
-and Home Assistant disagreeing about timezone cannot shift them.
-
 ## Development
+
+```
+reminders_ha_sync.py       the whole thing
+install.sh                 what the one-liner runs
+config.example.json        the minimum: a URL and a token
+config.full-example.json   every option, with its default
+docker-compose.yml + dev/  throwaway HA on :8124 for testing
+tests/test_merge.py        merge-engine and pairing unit tests (nothing live)
+tests/e2e.py               real round trips against the dev HA
+```
 
 The dev instance runs on **:8124** so it can sit next to a real one on :8123.
 
 ```sh
 make ha-up        # start it, onboard it, create the test lists, write dev/config.json
-make test         # merge-engine unit tests -- no HA, no Reminders access
+make test         # unit tests -- no HA, no Reminders access
 make e2e          # real round trips: dev HA <-> the "RHS Test" Reminders list
 make dev-dry-run  # what a sync against the dev instance would change
 make ha-reset     # wipe it and start over
@@ -233,9 +283,16 @@ make ha-reset     # wipe it and start over
 `make ha-up` logs in as `dev` / `devdevdev` at http://127.0.0.1:8124. Onboarding
 gives a refresh token, kept in `dev/secrets.json`; every make target re-mints a
 30-minute access token from it into `dev/config.json`, which is why there is no
-long-lived token to manage here.
+long-lived token to manage here — and why `tests/e2e.py` must be run through
+`make`, not on its own.
 
 `tests/e2e.py` **empties the Reminders list it is pointed at**, on both sides,
 before each scenario. It only ever touches the lists named in `dev/config.json`
 (`RHS Test`, `RHS Покупки`) and refuses to run if they do not exist unless you
 pass `--create-lists`.
+
+To test the installer against a checkout instead of GitHub:
+
+```sh
+RHS_BASE_URL="file://$PWD" RHS_BIN_DIR=/tmp/rhs-bin RHS_CONFIG=/tmp/rhs.json ./install.sh
+```
