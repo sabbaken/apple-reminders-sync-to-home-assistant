@@ -16,7 +16,7 @@ class RemindersHaSync < Formula
   url "https://github.com/sabbaken/apple-reminders-sync-to-home-assistant/archive/refs/tags/v0.1.0.tar.gz"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "AGPL-3.0-only"
-  head "https://github.com/sabbaken/apple-reminders-sync-to-home-assistant.git", branch: "main"
+  head "https://github.com/sabbaken/apple-reminders-sync-to-home-assistant.git", branch: "master"
 
   # Reminders is a macOS app; there is nothing to sync anywhere else.
   depends_on :macos
