@@ -1,0 +1,23 @@
+# Throwaway Home Assistant used only for developing/testing this sync script.
+# Never point this at a real HA config directory.
+#
+#   make ha-up        start it + run onboarding + create the test todo lists
+#   make ha-down      stop it
+#   make ha-reset     stop it and wipe the generated config (bind mount, so
+#                     `down -v` alone does NOT reset anything)
+#
+# Port 8124, not 8123, so this can run next to another local HA instance.
+
+name: reminders-ha-sync-dev
+
+services:
+  homeassistant:
+    image: ghcr.io/home-assistant/home-assistant:stable
+    container_name: reminders-ha-sync-ha
+    restart: unless-stopped
+    ports:
+      - '8124:8123'
+    environment:
+      TZ: ${TZ:-Europe/Warsaw}
+    volumes:
+      - ./dev/ha-config:/config

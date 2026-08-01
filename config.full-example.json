@@ -1,0 +1,19 @@
+{
+  "home_assistant": {
+    "url": "http://homeassistant.local:8123",
+    "token": "paste-a-long-lived-access-token-here",
+    "timeout": 20,
+    "verify_tls": true
+  },
+
+  "lists": "auto",
+  "exclude": ["Movies", "todo.shopping_list"],
+  "create_missing": "both",
+  "reminders_source": null,
+
+  "conflict_winner": "reminders",
+  "due_from_ha": "revert",
+  "match_by_title": true,
+  "max_deletes_per_run": 25,
+  "log_level": "info"
+}

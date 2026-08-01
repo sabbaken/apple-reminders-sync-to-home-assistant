@@ -1,0 +1,21 @@
+.DS_Store
+__pycache__/
+*.pyc
+
+# Editors
+.idea/
+.vscode/
+
+# Dev Home Assistant instance: keep the config we seed, ignore everything the
+# container generates (state, db, logs, secrets).
+dev/ha-config/*
+!dev/ha-config/configuration.yaml
+
+# Bootstrap output: HA credentials and the generated sync config for the dev
+# instance. Contains tokens.
+dev/secrets.json
+dev/config.json
+
+# A real config lives in ~/.config/reminders-ha-sync/, but make it hard to
+# commit one by accident.
+config.json
