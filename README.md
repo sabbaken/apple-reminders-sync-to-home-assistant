@@ -301,6 +301,9 @@ brew tap sabbaken/tap https://github.com/sabbaken/apple-reminders-sync-to-home-a
 brew install sabbaken/tap/reminders-ha-sync
 ```
 
+The formula copies `LICENSE` into the install prefix, because the script is
+installed as a single standalone file and would otherwise arrive without one.
+
 Each release:
 
 1. Bump `VERSION` in `reminders_ha_sync.py`, commit.
@@ -311,3 +314,8 @@ Each release:
 4. Paste that over `Formula/reminders-ha-sync.rb` in the tap, commit, push.
 
 Users then get it with `brew upgrade`.
+
+## Licence
+
+[GNU AGPL v3.0 only](LICENSE). If you run a modified version somewhere others
+interact with over a network, the AGPL asks you to offer them its source.

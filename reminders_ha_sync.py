@@ -19,6 +19,9 @@ ones are created on both sides, so there is nothing to map by hand.
     ./reminders_ha_sync.py uninstall      unload + remove it
 
 See README.md for the config format and the sync rules.
+
+Licensed under the GNU Affero General Public License, version 3 only.
+Source and licence: https://github.com/sabbaken/apple-reminders-sync-to-home-assistant
 """
 
 from __future__ import annotations

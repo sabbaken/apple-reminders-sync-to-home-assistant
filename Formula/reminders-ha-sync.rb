@@ -15,8 +15,7 @@ class RemindersHaSync < Formula
   homepage "https://github.com/sabbaken/apple-reminders-sync-to-home-assistant"
   url "https://github.com/sabbaken/apple-reminders-sync-to-home-assistant/archive/refs/tags/v0.1.0.tar.gz"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
-  # TODO: pick a license and add a LICENSE file, then set it here, e.g.
-  # license "AGPL-3.0-only"
+  license "AGPL-3.0-only"
   head "https://github.com/sabbaken/apple-reminders-sync-to-home-assistant.git", branch: "main"
 
   # Reminders is a macOS app; there is nothing to sync anywhere else.
@@ -33,6 +32,8 @@ class RemindersHaSync < Formula
 
   def install
     bin.install "reminders_ha_sync.py" => "reminders-ha-sync"
+    # The script is installed on its own, so keep the licence next to it.
+    prefix.install "LICENSE"
   end
 
   def caveats
