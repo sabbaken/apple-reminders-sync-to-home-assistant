@@ -18,12 +18,13 @@ class RemindersHaSync < Formula
   license "AGPL-3.0-only"
   head "https://github.com/sabbaken/apple-reminders-sync-to-home-assistant.git", branch: "master"
 
+  # The thing that actually talks to the Reminders app. Cross-tap dependencies
+  # are fine -- Homebrew taps keith/formulae on demand. Named dependencies come
+  # before symbol ones or `brew audit --strict` fails on the ordering.
+  depends_on "keith/formulae/reminders-cli"
+
   # Reminders is a macOS app; there is nothing to sync anywhere else.
   depends_on :macos
-
-  # The thing that actually talks to the Reminders app. Cross-tap dependencies
-  # are fine -- Homebrew taps keith/formulae on demand.
-  depends_on "keith/formulae/reminders-cli"
 
   # No Python dependency on purpose: the script is standard-library only and
   # runs under the /usr/bin/python3 macOS ships, which is also the interpreter
