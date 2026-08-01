@@ -46,14 +46,20 @@ from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 LOG = logging.getLogger("reminders-ha-sync")
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 # abspath, deliberately not realpath. Installed by Homebrew this resolves to
 # /opt/homebrew/bin/reminders-ha-sync -- a symlink that `brew upgrade` repoints
 # at the new version. Resolving it would bake a Cellar path into the LaunchAgent
 # and the agent would break on the next upgrade.
 SCRIPT_PATH = os.path.abspath(__file__)
-LAUNCH_LABEL = "com.github.keith-reminders-ha-sync"
+LAUNCH_LABEL = "com.github.sabbaken.reminders-ha-sync"
+
+# Labels this agent used to install under. They have to be booted out and
+# deleted on the way past, or an upgrade leaves the old agent loaded alongside
+# the new one and two syncs race each other over the same state file.
+# `com.github.keith-…` was a copy-paste of reminders-cli's namespace.
+LEGACY_LAUNCH_LABELS = ("com.github.keith-reminders-ha-sync",)
 
 DEFAULT_CONFIG_PATH = "~/.config/reminders-ha-sync/config.json"
 DEFAULT_STATE_PATH = "~/.local/state/reminders-ha-sync/state.json"
@@ -74,6 +80,15 @@ STATE_VERSION = 1
 
 class UserError(Exception):
     """Something the user can fix: bad config, missing list, denied access."""
+
+
+class RemindersAccessError(UserError):
+    """Reminders could not be read.
+
+    Either no grant exists, or one exists that macOS will not honour. Its own
+    type because two very different-looking failures mean the same thing and
+    both want the same walkthrough -- see `Reminders.lists`.
+    """
 
 
 # --------------------------------------------------------------------------- #
@@ -347,15 +362,42 @@ class Reminders:
         if check and proc.returncode != 0:
             message = (proc.stderr or proc.stdout or "").strip()
             if "grant reminders access" in message:
-                raise UserError(
+                raise RemindersAccessError(
                     "Reminders access has not been granted to %s.\n"
                     "Run it once from Terminal.app and click Allow:\n"
                     "    %s show-lists\n"
                     "If no dialog appears, enable it under System Settings -> "
                     "Privacy & Security -> Reminders." % (self.binary, self.binary)
                 )
+            # The other face of a refused read: with no readable list source
+            # every write fails on this instead, one message per attempt.
+            if "No existing list sources were found" in message:
+                raise RemindersAccessError(self.access_hint())
             raise UserError("`%s` failed: %s" % (" ".join(cmd), message))
         return proc.returncode, proc.stdout, proc.stderr
+
+    def access_hint(self) -> str:
+        """The walkthrough for a read that came back refused or empty."""
+        return (
+            "Reminders returned nothing at all -- no lists, no error. That is\n"
+            "what a refused read looks like from here: reminders-cli reports a\n"
+            "missing permission as an empty result and exit 0, so a Mac with no\n"
+            "lists and a Mac that will not let this process see them are\n"
+            "indistinguishable.\n"
+            "\n"
+            "If your lists do show up when you run this yourself:\n"
+            "    %s show-lists\n"
+            "then the grant exists but macOS will not apply it to a background\n"
+            "run. Check the signature -- Homebrew ships the binary\n"
+            "linker-signed, which macOS refuses to validate, and TCC stores a\n"
+            "grant together with a requirement that unvalidatable code can\n"
+            "never satisfy:\n"
+            "    codesign --verify --strict %s\n"
+            "If that fails, re-sign it and allow the prompt once more:\n"
+            "    codesign --force --sign - %s\n"
+            "Otherwise enable it under System Settings -> Privacy & Security ->\n"
+            "Reminders." % (self.binary, self.binary, self.binary)
+        )
 
     def _run_json(self, args: Sequence[str]) -> object:
         _, out, _ = self._run(args)
@@ -371,7 +413,15 @@ class Reminders:
         return json.loads(text[start:])
 
     def lists(self) -> List[str]:
-        return list(self._run_json(["show-lists", "--format", "json"]))
+        names = list(self._run_json(["show-lists", "--format", "json"]))
+        if not names:
+            # Never treat this as "the Mac has no lists". It is overwhelmingly
+            # a refused read, and taking it at face value is worse than
+            # useless: in auto mode zero Reminders lists means every Home
+            # Assistant list looks unpaired, so the sync sets about recreating
+            # all of them in Reminders -- failing on each, every run, forever.
+            raise RemindersAccessError(self.access_hint())
+        return names
 
     def new_list(self, name: str, source: Optional[str] = None) -> None:
         args = ["new-list", name]
@@ -444,6 +494,44 @@ class Reminders:
         means the reminder is completed -- `delete` only looks at open ones."""
         code, _, _ = self._run(["delete", list_name, item_id], check=False)
         return code == 0
+
+
+def signature_check(binary: str) -> Tuple[bool, str]:
+    """Whether macOS can validate the binary's code signature.
+
+    This is the one check that predicts the LaunchAgent failing while a
+    terminal keeps working. Homebrew ships `reminders` linker-signed, which
+    SecStaticCodeCheckValidity rejects outright ("code object is not signed at
+    all"), and TCC stores every grant together with a code requirement. A
+    requirement against unvalidatable code fails on the next check, so the
+    grant never holds: macOS re-prompts each run and hands back nothing in
+    between. Run from a terminal the same binary is fine, because there the
+    responsible process is the signed terminal app, which holds the grant
+    instead.
+    """
+    if not os.path.exists(binary):
+        # Reported by the access check right below, and re-signing a file that
+        # is not there is no kind of advice.
+        return True, "not checked: %s does not exist" % binary
+    try:
+        proc = subprocess.run(
+            ["/usr/bin/codesign", "--verify", "--strict", binary],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+        )
+    except OSError as exc:
+        # No codesign, no diagnosis -- but not a finding of its own.
+        return True, "not checked: %s" % exc
+    if proc.returncode == 0:
+        return True, "valid"
+    lines = (proc.stdout or "").strip().splitlines()
+    return False, (
+        "%s; TCC cannot hold a grant against it, so the LaunchAgent will be "
+        "refused Reminders on every run. Re-sign it with: "
+        "codesign --force --sign - %s"
+        % (lines[-1] if lines else "codesign --verify failed", binary)
+    )
 
 
 def format_due_for_cli(due: str) -> str:
@@ -1540,15 +1628,25 @@ def cmd_doctor(config: Config) -> int:
     print("python      %s" % sys.version.split()[0])
     print()
 
+    reminders: Optional[Reminders] = None
     try:
         reminders = Reminders(config.reminders_binary)
-        print("reminders   %s" % reminders.binary)
-        names = reminders.lists()
-        check("Reminders access", True, "%d lists" % len(names))
     except UserError as exc:
-        check("Reminders access", False, str(exc).splitlines()[0])
-        names = []
-        reminders = None
+        check("reminders-cli", False, str(exc).splitlines()[0])
+
+    if reminders is not None:
+        print("reminders   %s" % reminders.binary)
+        # Before the access check, because an unvalidatable signature is the
+        # usual reason a grant that works here is missing under launchd -- and
+        # the access check below cannot see the difference.
+        signed, detail = signature_check(reminders.binary)
+        check("reminders signature", signed, detail)
+        try:
+            names = reminders.lists()
+            check("Reminders access", True, "%d lists" % len(names))
+        except UserError as exc:
+            check("Reminders access", False, str(exc).splitlines()[0])
+            reminders = None
 
     ha = HomeAssistant(
         config.ha_url, config.ha_token, config.ha_timeout, config.ha_verify_tls
@@ -1609,11 +1707,50 @@ def cmd_doctor(config: Config) -> int:
     else:
         print("--   LaunchAgent not installed (run `%s install`)" % os.path.basename(SCRIPT_PATH))
 
+    # Either the agent predates the rename and is still the live one, or both
+    # are loaded and syncing the same pairs on two schedules. Both want the
+    # same fix, but saying the wrong one sends the reader off the wrong way.
+    for label in LEGACY_LAUNCH_LABELS:
+        legacy = launch_agent_path(label)
+        if os.path.exists(legacy):
+            check(
+                "old LaunchAgent still installed",
+                False,
+                "%s -- %s; `%s install` replaces it"
+                % (
+                    legacy,
+                    "two agents are syncing the same lists"
+                    if os.path.exists(plist)
+                    else "left by a version before the label was renamed",
+                    os.path.basename(SCRIPT_PATH),
+                ),
+            )
+
     return 1 if problems else 0
 
 
-def launch_agent_path() -> str:
-    return expand("~/Library/LaunchAgents/%s.plist" % LAUNCH_LABEL)
+def launch_agent_path(label: str = LAUNCH_LABEL) -> str:
+    return expand("~/Library/LaunchAgents/%s.plist" % label)
+
+
+def remove_launch_agent(label: str) -> bool:
+    """Boot out an agent and delete its plist. True if there was one."""
+    subprocess.run(
+        ["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), label)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    path = launch_agent_path(label)
+    if not os.path.exists(path):
+        return False
+    os.remove(path)
+    return True
+
+
+def drop_legacy_launch_agents() -> None:
+    for label in LEGACY_LAUNCH_LABELS:
+        if remove_launch_agent(label):
+            LOG.info("removed the old LaunchAgent %s", label)
 
 
 # --------------------------------------------------------------------------- #
@@ -1661,20 +1798,11 @@ def wait_for_reminders_access(reminders: Reminders) -> List[str]:
     while True:
         try:
             return reminders.lists()
-        except UserError as exc:
-            if "access has not been granted" not in str(exc):
-                raise
+        except RemindersAccessError as exc:
+            # The exception carries the walkthrough, so both the outright
+            # refusal and the silent empty read get the advice that fits.
             print()
-            print("macOS has not granted Reminders access to:")
-            print("    %s" % reminders.binary)
-            print()
-            print("Run this in a terminal window you opened yourself, and click")
-            print("Allow when the dialog appears:")
-            print()
-            print("    %s show-lists" % reminders.binary)
-            print()
-            print("If no dialog appears, switch it on under System Settings ->")
-            print("Privacy & Security -> Reminders.")
+            print(str(exc))
             print()
             if not confirm("Granted it? Check again"):
                 raise UserError(
@@ -1885,6 +2013,10 @@ def cmd_install(config: Config, interval: int, initial_sync: bool = True) -> int
             )
         print()
 
+    # Before writing the new one: an agent installed under the old label would
+    # otherwise stay loaded and sync the same pairs on its own schedule.
+    drop_legacy_launch_agents()
+
     plist_path = launch_agent_path()
     os.makedirs(os.path.dirname(plist_path), exist_ok=True)
     os.makedirs(os.path.dirname(config.log_file), exist_ok=True)
@@ -1935,15 +2067,16 @@ def cmd_install(config: Config, interval: int, initial_sync: bool = True) -> int
 
 def cmd_uninstall() -> int:
     plist_path = launch_agent_path()
-    subprocess.run(
-        ["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), LAUNCH_LABEL)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    if os.path.exists(plist_path):
-        os.remove(plist_path)
+    removed = remove_launch_agent(LAUNCH_LABEL)
+    if removed:
         print("removed %s" % plist_path)
-    else:
+    # Uninstall has to mean uninstalled, whichever label the agent went in
+    # under, or an old one keeps syncing after the user thinks it stopped.
+    for label in LEGACY_LAUNCH_LABELS:
+        if remove_launch_agent(label):
+            print("removed %s" % launch_agent_path(label))
+            removed = True
+    if not removed:
         print("nothing to remove at %s" % plist_path)
     return 0
 
@@ -1967,15 +2100,23 @@ def cmd_run(config: Config, interval: int) -> int:
 # --------------------------------------------------------------------------- #
 
 
+def is_same_file(fd: int, path: str) -> bool:
+    """Whether an already-open descriptor and a path are the same file."""
+    try:
+        open_stat = os.fstat(fd)
+        path_stat = os.stat(path)
+    except OSError:
+        return False
+    return (open_stat.st_dev, open_stat.st_ino) == (path_stat.st_dev, path_stat.st_ino)
+
+
 def setup_logging(level_name: str, log_file: Optional[str]) -> None:
     level = getattr(logging, level_name.upper(), logging.INFO)
     LOG.setLevel(level)
     formatter = logging.Formatter("%(asctime)s %(levelname)-7s %(message)s", "%Y-%m-%d %H:%M:%S")
 
-    stream = logging.StreamHandler()
-    stream.setFormatter(formatter)
-    LOG.addHandler(stream)
-
+    file_error = None
+    logging_to: Optional[str] = None
     if log_file:
         try:
             os.makedirs(os.path.dirname(log_file), exist_ok=True)
@@ -1984,8 +2125,23 @@ def setup_logging(level_name: str, log_file: Optional[str]) -> None:
             )
             rotating.setFormatter(formatter)
             LOG.addHandler(rotating)
+            logging_to = log_file
         except OSError as exc:
-            LOG.warning("cannot write to log file %s: %s", log_file, exc)
+            file_error = exc
+
+    # The LaunchAgent points StandardErrorPath at the log file, so under
+    # launchd a stream handler writes every line into it a second time -- which
+    # is exactly what it used to do. Comparing inodes catches the redirect
+    # however it was set up, and leaves the handler in place for the cases that
+    # want it: a terminal, or a pipe someone is watching. launchd's own
+    # redirect still catches anything logging cannot, tracebacks above all.
+    if logging_to is None or not is_same_file(2, logging_to):
+        stream = logging.StreamHandler()
+        stream.setFormatter(formatter)
+        LOG.addHandler(stream)
+
+    if file_error is not None:
+        LOG.warning("cannot write to log file %s: %s", log_file, file_error)
 
 
 def build_parser() -> argparse.ArgumentParser:

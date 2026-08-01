@@ -75,7 +75,7 @@ Sync now and start syncing every 600s (Y/n):
 running the first sync...
 HA +12 ~0 -0 | Reminders +0 ~0 -0 | failures 0
 
-installed /Users/you/Library/LaunchAgents/com.github.keith-reminders-ha-sync.plist
+installed /Users/you/Library/LaunchAgents/com.github.sabbaken.reminders-ha-sync.plist
 syncing every 600 seconds; log: /Users/you/Library/Logs/reminders-ha-sync.log
 
 Done. Check on it any time with:

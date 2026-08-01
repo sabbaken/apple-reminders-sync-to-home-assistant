@@ -9,10 +9,13 @@ functions, so they get tested without Reminders access or a live Home Assistant.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
+import io
 import logging
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -621,6 +624,196 @@ class PairingTest(unittest.TestCase):
             ha,
         )
         self.assertEqual((reminders.created, ha.created), ([], []))
+
+
+class FakeProc:
+    def __init__(self, returncode, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class RemindersAccessTest(unittest.TestCase):
+    """A refused read must never pass for a Mac with nothing on it.
+
+    reminders-cli has three ways of saying the same thing and only one of them
+    looks like an error, which is how a permission problem spent an afternoon
+    masquerading as an empty list of lists.
+    """
+
+    def reminders(self) -> rhs.Reminders:
+        return rhs.Reminders(binary="/nowhere/reminders")
+
+    def run_returning(self, proc: FakeProc):
+        """Swap out subprocess.run for one canned result, restored after."""
+        real = rhs.subprocess.run
+        rhs.subprocess.run = lambda *args, **kwargs: proc
+        self.addCleanup(setattr, rhs.subprocess, "run", real)
+
+    def test_no_lists_is_an_access_error(self):
+        reminders = self.reminders()
+        reminders._run_json = lambda args: []
+        with self.assertRaises(rhs.RemindersAccessError):
+            reminders.lists()
+
+    def test_real_lists_come_back_unchanged(self):
+        reminders = self.reminders()
+        reminders._run_json = lambda args: ["Покупки", "Movies"]
+        self.assertEqual(reminders.lists(), ["Покупки", "Movies"])
+
+    def test_the_hint_names_the_signature_check(self):
+        # The one thing that separates "works in a terminal, not under
+        # launchd" from every other cause, so it has to be in the message.
+        hint = self.reminders().access_hint()
+        self.assertIn("codesign --verify", hint)
+        self.assertIn("codesign --force --sign -", hint)
+
+    def test_signature_check_holds_its_tongue_about_a_missing_binary(self):
+        ok, detail = rhs.signature_check("/nowhere/reminders")
+        self.assertTrue(ok)
+        self.assertNotIn("codesign --force", detail)
+
+    def test_missing_list_source_is_an_access_error(self):
+        self.run_returning(
+            FakeProc(1, "", "No existing list sources were found, please create a list in Reminders.app")
+        )
+        with self.assertRaises(rhs.RemindersAccessError):
+            self.reminders().new_list("Movies")
+
+    def test_ungranted_access_is_an_access_error(self):
+        self.run_returning(FakeProc(1, "", "error: failed to grant reminders access"))
+        with self.assertRaises(rhs.RemindersAccessError):
+            self.reminders().lists()
+
+    def test_an_ordinary_failure_stays_an_ordinary_failure(self):
+        self.run_returning(FakeProc(1, "", "no reminder at index 4"))
+        with self.assertRaises(rhs.UserError) as caught:
+            self.reminders().lists()
+        self.assertNotIsInstance(caught.exception, rhs.RemindersAccessError)
+
+
+class LegacyLaunchAgentTest(unittest.TestCase):
+    """Renaming the label must not leave the previous agent behind.
+
+    An orphan stays loaded on its own schedule and syncs the same pairs out of
+    the same state file, which is a worse failure than never renaming it.
+    """
+
+    def setUp(self):
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        self.home = home.name
+        self.saved_home = os.environ.get("HOME")
+        os.environ["HOME"] = self.home
+        self.addCleanup(self.restore_home)
+        os.makedirs(os.path.join(self.home, "Library", "LaunchAgents"))
+
+        # launchctl is not something a unit test should be reaching for.
+        self.commands = []
+        real = rhs.subprocess.run
+
+        def record(args, **kwargs):
+            self.commands.append(list(args))
+            return FakeProc(0)
+
+        rhs.subprocess.run = record
+        self.addCleanup(setattr, rhs.subprocess, "run", real)
+
+    def restore_home(self):
+        if self.saved_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = self.saved_home
+
+    def legacy_path(self) -> str:
+        return rhs.launch_agent_path(rhs.LEGACY_LAUNCH_LABELS[0])
+
+    def uninstall(self) -> str:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(rhs.cmd_uninstall(), 0)
+        return out.getvalue()
+
+    def test_uninstall_removes_a_legacy_agent(self):
+        path = self.legacy_path()
+        open(path, "w").close()
+        self.assertIn(path, self.uninstall())
+        self.assertFalse(os.path.exists(path))
+
+    def test_install_drops_a_legacy_agent(self):
+        path = self.legacy_path()
+        open(path, "w").close()
+        rhs.drop_legacy_launch_agents()
+        self.assertFalse(os.path.exists(path))
+        self.assertIn(
+            [
+                "launchctl",
+                "bootout",
+                "gui/%d/%s" % (os.getuid(), rhs.LEGACY_LAUNCH_LABELS[0]),
+            ],
+            self.commands,
+        )
+
+    def test_nothing_installed_is_not_a_failure(self):
+        self.assertIn("nothing to remove", self.uninstall())
+
+    def test_the_current_label_is_not_in_the_legacy_list(self):
+        # Listing it there would have install boot out what it just wrote.
+        self.assertNotIn(rhs.LAUNCH_LABEL, rhs.LEGACY_LAUNCH_LABELS)
+
+
+class LogRoutingTest(unittest.TestCase):
+    """The LaunchAgent redirects stderr into the log file, so a stream handler
+    on top of the file handler writes every line twice."""
+
+    def isolate_log(self) -> None:
+        saved, level = list(rhs.LOG.handlers), rhs.LOG.level
+        rhs.LOG.handlers = []
+
+        def restore():
+            for handler in rhs.LOG.handlers:
+                handler.close()
+            rhs.LOG.handlers = saved
+            rhs.LOG.setLevel(level)
+
+        self.addCleanup(restore)
+
+    def test_same_file_seen_through_a_redirect(self):
+        with tempfile.NamedTemporaryFile() as fh:
+            self.assertTrue(rhs.is_same_file(fh.fileno(), fh.name))
+
+    def test_different_files_are_not_confused(self):
+        with tempfile.NamedTemporaryFile() as one, tempfile.NamedTemporaryFile() as two:
+            self.assertFalse(rhs.is_same_file(one.fileno(), two.name))
+
+    def test_a_path_that_is_not_there_is_not_the_same_file(self):
+        with tempfile.NamedTemporaryFile() as fh:
+            self.assertFalse(rhs.is_same_file(fh.fileno(), fh.name + ".gone"))
+
+    def test_stderr_on_the_log_file_gets_one_handler(self):
+        self.isolate_log()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "sync.log")
+            saved_fd = os.dup(2)
+            try:
+                with open(path, "a") as fh:
+                    os.dup2(fh.fileno(), 2)
+                rhs.setup_logging("info", path)
+            finally:
+                os.dup2(saved_fd, 2)
+                os.close(saved_fd)
+            self.assertEqual(
+                [type(h).__name__ for h in rhs.LOG.handlers], ["RotatingFileHandler"]
+            )
+
+    def test_stderr_elsewhere_still_gets_the_stream_handler(self):
+        self.isolate_log()
+        with tempfile.TemporaryDirectory() as tmp:
+            rhs.setup_logging("info", os.path.join(tmp, "sync.log"))
+            self.assertEqual(
+                [type(h).__name__ for h in rhs.LOG.handlers],
+                ["RotatingFileHandler", "StreamHandler"],
+            )
 
 
 class ConfigTest(unittest.TestCase):

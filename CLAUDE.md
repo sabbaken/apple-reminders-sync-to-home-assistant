@@ -149,77 +149,106 @@ reminders. Everything here follows:
     reads a missing value as "unchanged". This is why `r_update` signals intent
     by *key presence*: `"notes" in update` means change it, and the value `None`
     means clear it. Passing `None` through to `edit` would silently do nothing.
+11. **A refused read looks exactly like an empty one.** Denied Reminders access
+    does not always come back as an error: `show-lists` prints `[]` and exits
+    0, and writes then fail with `No existing list sources were found`. So
+    `Reminders.lists()` treats no lists as `RemindersAccessError` rather than
+    as a Mac with nothing on it. Take the empty list at face value and auto
+    mode reads every Home Assistant list as unpaired and sets about recreating
+    all of them in Reminders, failing on each, every run, forever — which is
+    precisely what shipped.
 
 ### The two sides' data models
 
-11. **Home Assistant strips summaries on write**, so `normalize_title` strips
+12. **Home Assistant strips summaries on write**, so `normalize_title` strips
     too. Skip it and a padded title looks like a change on every single sync.
-12. **Empty is None on both sides.** `""` and absent must not look different, or
+13. **Empty is None on both sides.** `""` and absent must not look different, or
     notes churn forever.
-13. **A due datetime at exactly local midnight is all-day.** Reminders has a
+14. **A due datetime at exactly local midnight is all-day.** Reminders has a
     real all-day flag but the CLI does not expose it, and midnight is what an
     all-day reminder serializes to. A reminder deliberately set to 00:00
     round-trips as all-day; this is the only signal available.
-14. **`due_date` and `due_datetime` are mutually exclusive** — sending both is a
+15. **`due_date` and `due_datetime` are mutually exclusive** — sending both is a
     400 — and either set to `null` clears the date. `due_payload` is the only
     place that decides which one to send.
-15. **Timed due dates go out with an explicit UTC offset**, so a mismatch
+16. **Timed due dates go out with an explicit UTC offset**, so a mismatch
     between the Mac's timezone and Home Assistant's cannot shift them. The dev
     container's TZ is pinned to Europe/Warsaw in both `docker-compose.yml` and
     `dev/ha-config/configuration.yaml` for the same reason.
-16. **`todo.add_item` returns no uid.** The only way to learn one is to re-read
+17. **`todo.add_item` returns no uid.** The only way to learn one is to re-read
     the list and look for uids that were not there before, matching on title —
     see `create_ha_items`. It also cannot set a status, so an item arriving
     already completed needs a follow-up `update_item`.
-17. **Reminders keeps completed items forever.** Seeding a list links only open
+18. **Reminders keeps completed items forever.** Seeding a list links only open
     items; already-completed ones are tombstoned. Afterwards an item that turns
     up completed is imported only if `completed_at` is newer than `last_sync`.
     Remove this and the first sync dumps years of history into Home Assistant.
-18. **Python 3.9 is the target.** `from __future__ import annotations` covers
+19. **Python 3.9 is the target.** `from __future__ import annotations` covers
     the syntax, but `datetime.fromisoformat` cannot read a trailing `Z` — which
     is exactly what reminders-cli emits — so `parse_iso` exists. No `match`, no
     3.10+ stdlib.
 
 ### Installed-in-the-wild concerns
 
-19. **The shebang is `#!/usr/bin/python3`, not `env python3`.** With pyenv on
+20. **The shebang is `#!/usr/bin/python3`, not `env python3`.** With pyenv on
     PATH, `env python3` picks a shim, and `launchd_python()` exists so the plist
     names the absolute system interpreter regardless. A shim in the plist needs a
     PATH launchd does not provide, and the agent would fail silently every run.
     The code stays 3.9-compatible so this is always a safe pin.
-20. **`setup` runs before a config exists**, so `main` dispatches it (and
+21. **`setup` runs before a config exists**, so `main` dispatches it (and
     `uninstall`) before `load_config`. It must never require one.
-21. **Prompts read `/dev/tty`, not stdin.** The installer can arrive down a pipe.
+22. **Prompts read `/dev/tty`, not stdin.** The installer can arrive down a pipe.
     `ask` opens the tty directly and `getpass` already does.
-22. **`SCRIPT_PATH` is `abspath`, never `realpath`.** Installed by Homebrew it
+23. **`SCRIPT_PATH` is `abspath`, never `realpath`.** Installed by Homebrew it
     must stay `/opt/homebrew/bin/reminders-ha-sync` — the symlink `brew upgrade`
     repoints. Resolve it and the LaunchAgent gets a Cellar path that the next
     upgrade takes away.
-23. **GitHub answers 200 with an HTML page for a tag that does not exist.** The
+24. **GitHub answers 200 with an HTML page for a tag that does not exist.** The
     status code proves nothing, so `dev/formula.py` checks the gzip magic, opens
     the tarball, and compares the `VERSION` inside it against the tag. Without
     that it would happily publish a checksum of an error page, and the formula
     would fail for every user.
+25. **Homebrew ships `reminders` linker-signed, and TCC cannot hold a grant
+    against it.** `codesign --verify --strict` says "code object is not signed
+    at all", so `SecStaticCodeCheckValidity` fails — and TCC stores every grant
+    together with a code requirement, which unvalidatable code can never
+    satisfy. The prompt reappears on every run, the answer never sticks, and in
+    between Reminders reads back empty. A terminal is immune because there the
+    responsible process is the signed terminal app, holding the grant instead;
+    that asymmetry is the whole reason this took an afternoon to find. The cure
+    is `codesign --force --sign - <binary>` and one more Allow, and it must be
+    redone after every `brew upgrade reminders-cli`. `signature_check` is in
+    `doctor` so the next occurrence costs one command.
+26. **The LaunchAgent's `StandardErrorPath` is the log file**, so a
+    `StreamHandler` on stderr writes every line into it a second time.
+    `setup_logging` compares the inode of fd 2 against the log path and skips
+    the stream handler when they match. Two writers also break rotation: the
+    handler renames the file and launchd keeps writing to the old descriptor.
+27. **Renaming `LAUNCH_LABEL` orphans the agent already installed.** The old
+    plist stays loaded and two syncs race over one state file, so
+    `LEGACY_LAUNCH_LABELS` lists every label ever used, `install` and
+    `uninstall` boot them out, and `doctor` reports a leftover. Add to that
+    tuple, never edit it.
 
 ### Pairing
 
-24. **Names are matched with `casefold`, not `lower`.** The lists are named in
+28. **Names are matched with `casefold`, not `lower`.** The lists are named in
     Russian; `lower` is not the right fold for non-ASCII.
-25. **Home Assistant transliterates a list name into its internal key**, so
+29. **Home Assistant transliterates a list name into its internal key**, so
     `Тест` and `Test` both want `test` and the second cannot be created. This is
     reported as a problem, never guessed around. Two Home Assistant lists
     sharing a name are likewise reported, not resolved.
-26. **An excluded list must not come back through the reverse direction.**
+30. **An excluded list must not come back through the reverse direction.**
     `resolve_pairs` skips any Home Assistant name already present in Reminders,
     excluded or not, before considering whether to create a Reminders list.
-27. **Creating a Home Assistant list needs an admin token**, because to-do
+31. **Creating a Home Assistant list needs an admin token**, because to-do
     entities come from config entries. `create_local_todo` walks the same config
     flow the UI walks, then finds the entity by friendly name — the entity id is
     a transliterated slug and must not be guessed.
-28. **Title adoption is what makes losing `state.json` survivable.** Unlinked
+32. **Title adoption is what makes losing `state.json` survivable.** Unlinked
     items with the same title are paired rather than duplicated, then merged by
     the ordinary rules with an empty `last`.
-29. **`max_deletes_per_run` is a bad-read guard.** A transient failure should
+33. **`max_deletes_per_run` is a bad-read guard.** A transient failure should
     not be able to empty both sides; exceeding it fails the pair and asks for
     `--force`.
 
@@ -250,6 +279,30 @@ non-bundled CLI binary is whatever launched it. A grant made in Terminal.app
 does not cover a run under an IDE, and vice versa — expect this to bite while
 developing, and expect `doctor` to be the fastest way to see it. The plist sets
 `LimitLoadToSessionType: Aqua` so the prompt can appear at all.
+
+Under launchd there is no responsible app, so attribution falls to the
+`reminders` binary itself — and as rule 25 says, a linker-signed binary cannot
+hold a grant at all. **This is the difference between a terminal and the
+LaunchAgent, and it is invisible from inside the sync**: both sides report
+success and Reminders simply reads back empty. The two commands worth reaching
+for first, in that order:
+
+```bash
+codesign --verify --strict /opt/homebrew/bin/reminders   # silence means fine
+/usr/bin/log show --last 10m --predicate 'process == "tccd"' --info \
+  --style compact | grep -iE "reminders-cli|Failed to match"
+```
+
+A working grant logs `matchesCodeRequirement … status: 0` and
+`Auth Right: Allowed (User Consent)`. A broken one logs `status: -67050` and
+`Failed to match existing code requirement` — every run, right after the user
+clicks Allow. Note `log` is a zsh builtin; without the absolute path the query
+silently does nothing.
+
+A durable fix would be to wrap the agent in a signed `.app` with a stable
+bundle id and point the plist at that, which survives `brew upgrade`. Not done:
+it trades the one-line re-sign for a build step, an Info.plist and a
+`NSRemindersUsageDescription`, and `doctor` now catches the breakage anyway.
 
 **EventKit via PyObjC and AppleScript were both evaluated and rejected.** PyObjC
 ships with neither the system Python nor a pyenv build, so it means a venv and a
