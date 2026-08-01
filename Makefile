@@ -24,8 +24,15 @@ e2e-create: ## Same, but create the RHS test lists in Reminders first
 
 .PHONY: check
 check: test ## Unit tests plus a syntax check of everything
-	$(PYTHON) -m py_compile $(SCRIPT) dev/bootstrap.py tests/e2e.py tests/test_merge.py
+	$(PYTHON) -m py_compile $(SCRIPT) dev/bootstrap.py dev/formula.py tests/e2e.py tests/test_merge.py
 	@echo "ok"
+
+# --- releasing -------------------------------------------------------------- #
+
+.PHONY: formula
+formula: ## Print the tap formula for a pushed tag: make formula TAG=v0.1.0
+	@test -n "$(TAG)" || { echo "usage: make formula TAG=v0.1.0" >&2; exit 2; }
+	@$(PYTHON) dev/formula.py --tag "$(TAG)"
 
 # --- dev Home Assistant ---------------------------------------------------- #
 

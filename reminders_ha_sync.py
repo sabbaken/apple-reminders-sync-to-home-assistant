@@ -43,6 +43,12 @@ from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 LOG = logging.getLogger("reminders-ha-sync")
 
+VERSION = "0.1.0"
+
+# abspath, deliberately not realpath. Installed by Homebrew this resolves to
+# /opt/homebrew/bin/reminders-ha-sync -- a symlink that `brew upgrade` repoints
+# at the new version. Resolving it would bake a Cellar path into the LaunchAgent
+# and the agent would break on the next upgrade.
 SCRIPT_PATH = os.path.abspath(__file__)
 LAUNCH_LABEL = "com.github.keith-reminders-ha-sync"
 
@@ -1523,6 +1529,8 @@ def cmd_doctor(config: Config) -> int:
         if not ok:
             problems += 1
 
+    print("version     %s" % VERSION)
+    print("script      %s" % SCRIPT_PATH)
     print("config      %s" % config.path)
     print("state       %s" % config.state_file)
     print("log         %s" % config.log_file)
@@ -1803,6 +1811,13 @@ def cmd_setup(config_path: str, args: argparse.Namespace) -> int:
     if not args.yes:
         interval = int(ask("Sync every how many seconds", str(interval)) or interval)
 
+    if args.no_sync:
+        print("Config written. Nothing has been synced and nothing installed.")
+        print()
+        print("Look before you leap:")
+        print("    %s sync --dry-run" % SCRIPT_PATH)
+        return 0
+
     if args.no_install:
         print("Syncing once, without installing the LaunchAgent...")
         result = sync_once(config)
@@ -1981,6 +1996,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="config file (default: %s)" % DEFAULT_CONFIG_PATH,
     )
     parser.add_argument("--verbose", "-v", action="store_true", help="debug logging")
+    parser.add_argument(
+        "--version", action="version", version="reminders-ha-sync " + VERSION
+    )
 
     sub = parser.add_subparsers(dest="command")
 
@@ -1995,6 +2013,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     setup.add_argument(
         "--no-install", action="store_true", help="configure and sync, but no LaunchAgent"
+    )
+    setup.add_argument(
+        "--no-sync",
+        action="store_true",
+        help="only write the config: sync nothing, install nothing",
     )
     setup.add_argument(
         "--yes", "-y", action="store_true", help="ask nothing; fail instead of prompting"

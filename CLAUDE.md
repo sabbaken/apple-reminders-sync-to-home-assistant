@@ -51,14 +51,26 @@ A single unit test, any of these:
 `make` re-mints one on every target; run the script on its own and it fails with
 a confusing 401. Go through `make e2e`, or `make ha-token` first.
 
-The installer, against this checkout instead of GitHub. Point it away from
-`~/.local/bin` and the real config, and pre-seed an `exclude` — auto mode would
-otherwise pair up every real list on the machine:
+The guided setup, non-interactively. **Always pass `--no-sync`**, and point
+`RHS_CONFIG` away from the real config:
 
 ```bash
-RHS_BASE_URL="file://$PWD" RHS_BIN_DIR=/tmp/rhs-bin RHS_CONFIG=/tmp/rhs.json \
-  ./install.sh --yes --no-install --url http://127.0.0.1:8124 --token "$(make ha-token)"
+RHS_CONFIG=/tmp/rhs.json ./reminders_ha_sync.py setup --yes --no-sync \
+  --url http://127.0.0.1:8124 --token "$(make ha-token)"
 ```
+
+`setup` without `--no-sync` ends in a real sync, and against a fresh config that
+means auto mode: every list on the machine paired up and pushed into whatever
+Home Assistant the config names, plus a Reminders list created for every list
+that Home Assistant has and Reminders does not. It also writes to the *real*
+`state_file` unless the config overrides it — and a state file describing pairs
+in the dev container is actively dangerous against a real instance, because
+links pointing at uids that no longer exist read as "deleted in Home Assistant"
+and propagate as deletions in Reminders. If a stray sync happens, delete
+`~/.local/state/reminders-ha-sync/state.json` before syncing for real.
+
+Releasing: `make formula TAG=v0.2.0` after the tag is pushed. See the README's
+"Publishing and releasing".
 
 ## Layout
 
@@ -75,7 +87,8 @@ reminders_ha_sync.py     everything, in banner-commented sections — grep for t
                            commands                  sync/run/doctor/lists/install/uninstall
                            guided setup              cmd_setup and its prompts
                            entry point               argparse + logging setup
-install.sh               what the README one-liner runs: brew, download, hand off to `setup`
+Formula/…rb              the Homebrew formula; distribution is a tap, see the README
+dev/formula.py           prints the formula for a pushed tag, with its sha256
 config.example.json      the whole config: url + token
 config.full-example.json every option with its default
 tests/test_merge.py      the pure layers, with FakeReminders/FakeHa for pairing
@@ -178,29 +191,35 @@ reminders. Everything here follows:
     `uninstall`) before `load_config`. It must never require one.
 21. **Prompts read `/dev/tty`, not stdin.** The installer can arrive down a pipe.
     `ask` opens the tty directly and `getpass` already does.
-22. **The installer asks for the Reminders permission itself**, before handing
-    over to `setup`. The dialog only appears for a process in the user's GUI
-    session — which the installer is and a LaunchAgent is not.
+22. **`SCRIPT_PATH` is `abspath`, never `realpath`.** Installed by Homebrew it
+    must stay `/opt/homebrew/bin/reminders-ha-sync` — the symlink `brew upgrade`
+    repoints. Resolve it and the LaunchAgent gets a Cellar path that the next
+    upgrade takes away.
+23. **GitHub answers 200 with an HTML page for a tag that does not exist.** The
+    status code proves nothing, so `dev/formula.py` checks the gzip magic, opens
+    the tarball, and compares the `VERSION` inside it against the tag. Without
+    that it would happily publish a checksum of an error page, and the formula
+    would fail for every user.
 
 ### Pairing
 
-23. **Names are matched with `casefold`, not `lower`.** The lists are named in
+24. **Names are matched with `casefold`, not `lower`.** The lists are named in
     Russian; `lower` is not the right fold for non-ASCII.
-24. **Home Assistant transliterates a list name into its internal key**, so
+25. **Home Assistant transliterates a list name into its internal key**, so
     `Тест` and `Test` both want `test` and the second cannot be created. This is
     reported as a problem, never guessed around. Two Home Assistant lists
     sharing a name are likewise reported, not resolved.
-25. **An excluded list must not come back through the reverse direction.**
+26. **An excluded list must not come back through the reverse direction.**
     `resolve_pairs` skips any Home Assistant name already present in Reminders,
     excluded or not, before considering whether to create a Reminders list.
-26. **Creating a Home Assistant list needs an admin token**, because to-do
+27. **Creating a Home Assistant list needs an admin token**, because to-do
     entities come from config entries. `create_local_todo` walks the same config
     flow the UI walks, then finds the entity by friendly name — the entity id is
     a transliterated slug and must not be guessed.
-27. **Title adoption is what makes losing `state.json` survivable.** Unlinked
+28. **Title adoption is what makes losing `state.json` survivable.** Unlinked
     items with the same title are paired rather than duplicated, then merged by
     the ordinary rules with an empty `last`.
-28. **`max_deletes_per_run` is a bad-read guard.** A transient failure should
+29. **`max_deletes_per_run` is a bad-read guard.** A transient failure should
     not be able to empty both sides; exceeding it fails the pair and asks for
     `--force`.
 

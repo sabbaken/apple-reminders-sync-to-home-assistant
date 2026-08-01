@@ -10,8 +10,10 @@ both sides, so there is nothing to configure beyond a token.
 
 ## Install
 
-**First, get a token.** This is the only thing you have to prepare, and it lives
-in the Home Assistant web interface:
+You need [Homebrew](https://brew.sh) and a Home Assistant token.
+
+**First, get the token.** This is the only thing you have to prepare, and it
+lives in the Home Assistant web interface:
 
 1. Click your name, bottom left of the sidebar.
 2. Open the **Security** tab.
@@ -22,22 +24,21 @@ Use an **administrator** account. Creating a to-do list means creating a config
 entry, which only an administrator may do. A non-admin token still syncs lists
 that already exist.
 
-**Then run this on the Mac whose Reminders you want to sync:**
+**Then, on the Mac whose Reminders you want to sync:**
 
 ```sh
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/sabbaken/apple-reminders-sync-to-home-assistant/main/install.sh)"
+brew install sabbaken/tap/reminders-ha-sync
+reminders-ha-sync setup
 ```
 
-It walks through the rest:
+The first command brings `reminders-cli` with it — that is the part that talks
+to the Reminders app. The second one walks through the rest:
 
-1. Installs `reminders-cli` with Homebrew, if it is not already there. (This is
-   what actually talks to the Reminders app.)
-2. Asks macOS for permission to read your Reminders — **click Allow**.
-3. Puts the sync script in `~/.local/bin/reminders-ha-sync`.
-4. Asks for your Home Assistant address and that token, and checks both work
+1. Asks macOS for permission to read your Reminders — **click Allow**.
+2. Asks for your Home Assistant address and that token, and checks both work
    before writing anything.
-5. Shows you which lists it is about to sync and lets you drop any of them.
-6. Syncs once while you watch, then keeps syncing every 10 minutes.
+3. Shows you which lists it is about to sync and lets you drop any of them.
+4. Syncs once while you watch, then keeps syncing every 10 minutes.
 
 Nothing needs `sudo`, and nothing is written outside your home directory.
 
@@ -45,9 +46,7 @@ Nothing needs `sudo`, and nothing is written outside your home directory.
 <summary>What it looks like</summary>
 
 ```
-Found reminders-cli at /opt/homebrew/bin/reminders
-Downloading the sync script to /Users/you/.local/bin/reminders-ha-sync
-
+$ reminders-ha-sync setup
 Setting up the Reminders <-> Home Assistant sync.
 Config will be written to /Users/you/.config/reminders-ha-sync/config.json
 
@@ -80,48 +79,39 @@ installed /Users/you/Library/LaunchAgents/com.github.keith-reminders-ha-sync.pli
 syncing every 600 seconds; log: /Users/you/Library/Logs/reminders-ha-sync.log
 
 Done. Check on it any time with:
-    /Users/you/.local/bin/reminders-ha-sync doctor
+    reminders-ha-sync doctor
 ```
 
 </details>
 
-### Rather not pipe a script into bash
-
-Fair. The installer does nothing you cannot do yourself:
+## Updating
 
 ```sh
-brew install keith/formulae/reminders-cli
-reminders show-lists                      # click Allow
-
-mkdir -p ~/.local/bin
-curl -fsSL https://raw.githubusercontent.com/sabbaken/apple-reminders-sync-to-home-assistant/main/reminders_ha_sync.py \
-  -o ~/.local/bin/reminders-ha-sync
-chmod 755 ~/.local/bin/reminders-ha-sync
-
-~/.local/bin/reminders-ha-sync setup
+brew update && brew upgrade reminders-ha-sync
 ```
+
+Your config and sync state are left alone, and the background syncs pick the new
+version up on their own: each one is a fresh process launched from
+`/opt/homebrew/bin/reminders-ha-sync`, a symlink `brew upgrade` repoints. There
+is nothing to restart.
 
 ## Everyday use
 
-`~/.local/bin` is often not on `PATH`, so these use the full path. Add the
-directory to your `PATH` if you would rather not.
-
 ```sh
-~/.local/bin/reminders-ha-sync doctor          # is everything healthy, and what pairs with what
-~/.local/bin/reminders-ha-sync sync --dry-run  # what would change, without changing it
-~/.local/bin/reminders-ha-sync sync            # sync now
-~/.local/bin/reminders-ha-sync setup           # change the address, token or list selection
-~/.local/bin/reminders-ha-sync uninstall       # stop syncing
+reminders-ha-sync doctor          # is everything healthy, and what pairs with what
+reminders-ha-sync sync --dry-run  # what would change, without changing it
+reminders-ha-sync sync            # sync now
+reminders-ha-sync setup           # change the address, token or list selection
+reminders-ha-sync uninstall       # stop syncing
 ```
 
 Syncs happen every 10 minutes, plus one at login. The log is
 `~/Library/Logs/reminders-ha-sync.log`, rotated at 2 MB. To sync more or less
-often, `install --interval 300`.
+often, `reminders-ha-sync install --interval 300`.
 
-**Update** by re-running the installer: it overwrites the script and keeps your
-config. **Uninstall** with `uninstall`, then delete
-`~/.local/bin/reminders-ha-sync` and `~/.config/reminders-ha-sync/`. Nothing is
-deleted from either Reminders or Home Assistant.
+To remove it completely: `reminders-ha-sync uninstall`, then
+`brew uninstall reminders-ha-sync` and delete `~/.config/reminders-ha-sync/`.
+Nothing is deleted from either Reminders or Home Assistant.
 
 If the background syncs fail with a permission error while the same command
 works when you type it, macOS is treating the LaunchAgent as a separate
@@ -261,13 +251,13 @@ change: seven methods, and the merge engine knows nothing about it.
 ## Development
 
 ```
-reminders_ha_sync.py       the whole thing
-install.sh                 what the one-liner runs
-config.example.json        the minimum: a URL and a token
-config.full-example.json   every option, with its default
-docker-compose.yml + dev/  throwaway HA on :8124 for testing
-tests/test_merge.py        merge-engine and pairing unit tests (nothing live)
-tests/e2e.py               real round trips against the dev HA
+reminders_ha_sync.py           the whole thing
+Formula/reminders-ha-sync.rb   the Homebrew formula, canonical copy
+config.example.json            the minimum: a URL and a token
+config.full-example.json       every option, with its default
+docker-compose.yml + dev/      throwaway HA on :8124 for testing
+tests/test_merge.py            merge-engine and pairing unit tests (nothing live)
+tests/e2e.py                   real round trips against the dev HA
 ```
 
 The dev instance runs on **:8124** so it can sit next to a real one on :8123.
@@ -291,8 +281,33 @@ before each scenario. It only ever touches the lists named in `dev/config.json`
 (`RHS Test`, `RHS Покупки`) and refuses to run if they do not exist unless you
 pass `--create-lists`.
 
-To test the installer against a checkout instead of GitHub:
+### Publishing and releasing
+
+`brew install sabbaken/tap/reminders-ha-sync` needs a tap, which is just a repo
+named `homebrew-tap` with the formula in `Formula/`. One-time setup:
 
 ```sh
-RHS_BASE_URL="file://$PWD" RHS_BIN_DIR=/tmp/rhs-bin RHS_CONFIG=/tmp/rhs.json ./install.sh
+gh repo create sabbaken/homebrew-tap --public --clone
+mkdir -p homebrew-tap/Formula
+cp Formula/reminders-ha-sync.rb homebrew-tap/Formula/
+# commit and push
 ```
+
+Prefer not to keep a second repo? Tap this one directly — the formula is already
+in `Formula/`, it just makes the install two commands for users:
+
+```sh
+brew tap sabbaken/tap https://github.com/sabbaken/apple-reminders-sync-to-home-assistant
+brew install sabbaken/tap/reminders-ha-sync
+```
+
+Each release:
+
+1. Bump `VERSION` in `reminders_ha_sync.py`, commit.
+2. `git tag v0.2.0 && git push --tags`
+3. `make formula TAG=v0.2.0` — prints the formula with the release's real
+   `sha256`, and refuses if the tag is not pushed or its `VERSION` does not
+   match.
+4. Paste that over `Formula/reminders-ha-sync.rb` in the tap, commit, push.
+
+Users then get it with `brew upgrade`.
