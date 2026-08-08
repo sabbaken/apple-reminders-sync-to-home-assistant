@@ -94,8 +94,23 @@ def request(
         return raw
 
 
+def core_api_up() -> bool:
+    """True once the core REST API is serving, onboarded or not.
+
+    Unauthenticated it answers 401, which is proof enough that HA is up; while
+    it is still booting the route does not exist yet and answers 404.
+    """
+    try:
+        request("GET", "/api/", timeout=5)
+    except HttpError as exc:
+        return exc.status != 404
+    except OSError:
+        return False
+    return True
+
+
 def wait_for_ha(timeout: float = 300.0) -> None:
-    """Block until the onboarding API answers, i.e. HA finished booting."""
+    """Block until HA is serving, i.e. it finished booting."""
     deadline = time.time() + timeout
     last = ""
     while time.time() < deadline:
@@ -104,8 +119,10 @@ def wait_for_ha(timeout: float = 300.0) -> None:
             return
         except HttpError as exc:
             # Any HTTP status means the server is up; onboarding may still be
-            # loading, so keep polling on 404.
-            if exc.status != 404:
+            # loading, so keep polling on 404 -- except that HA *removes* the
+            # onboarding views once onboarding is complete, so a 404 also means
+            # a fully booted instance. The core API tells the two apart.
+            if exc.status != 404 or core_api_up():
                 return
             last = str(exc)
         except OSError as exc:
@@ -114,8 +131,14 @@ def wait_for_ha(timeout: float = 300.0) -> None:
     raise SystemExit("home assistant did not come up at %s (%s)" % (BASE_URL, last))
 
 
-def onboarding_steps() -> dict:
-    steps = request("GET", "/api/onboarding")
+def onboarding_steps() -> dict | None:
+    """Map step -> done, or None once HA has taken the onboarding views away."""
+    try:
+        steps = request("GET", "/api/onboarding")
+    except HttpError as exc:
+        if exc.status == 404:
+            return None
+        raise
     return {s["step"]: s["done"] for s in steps}
 
 
@@ -141,7 +164,9 @@ def onboard() -> str:
     secrets = load_secrets()
     steps = onboarding_steps()
 
-    if steps.get("user"):
+    # No steps at all means the views are gone, which HA does only after
+    # onboarding finishes -- the same situation as the user step being done.
+    if steps is None or steps.get("user"):
         if not secrets.get("refresh_token"):
             raise SystemExit(
                 "HA is already onboarded but %s has no refresh token.\n"
