@@ -843,13 +843,24 @@ class HomeAssistant:
         """
         path = "/api/webhook/" + urllib.parse.quote(webhook_id)
         try:
-            return self._request("POST", path, payload, authenticated=False)
+            result = self._request("POST", path, payload, authenticated=False)
         except UserError as exc:
             # 410 is the documented "this webhook is gone"; 404 is what a
             # deleted registration answers on some versions.
             if "returned 410" in str(exc) or "returned 404" in str(exc):
                 raise MobileAppGone(webhook_id) from None
             raise
+        # Current versions answer neither: an unknown webhook id gets a plain
+        # 200 with an empty body, deliberately, so that probing cannot tell a
+        # live id from a dead one. Every type this program sends answers with a
+        # JSON object while the registration is live -- `register_sensor` with
+        # {"success": ...}, `update_sensor_states` with a result per sensor --
+        # so an empty body is the only evidence there is. Take it for an answer
+        # and a device deleted in Home Assistant is never rebuilt: every run
+        # posts into the void, counts the device as published, and says so.
+        if not isinstance(result, dict):
+            raise MobileAppGone(webhook_id)
+        return result
 
 
 def due_payload(due: Optional[str]) -> dict:
@@ -1533,7 +1544,17 @@ def publish_batteries(config: Config, dry_run: bool = False) -> int:
                 entry = store.remember(
                     device.key, str(registration["webhook_id"]), device.name
                 )
-                publish_device(ha, entry, device, readings)
+                try:
+                    publish_device(ha, entry, device, readings)
+                except MobileAppGone:
+                    # A registration that is gone again the moment it was made
+                    # is a problem with this Home Assistant, not something a
+                    # third attempt fixes. It must not escape as a traceback:
+                    # the devices after this one still deserve their run.
+                    raise UserError(
+                        "Home Assistant forgot the registration for %s again, "
+                        "immediately after creating it" % device.name
+                    ) from None
         except UserError as exc:
             LOG.error("%s: %s", device.name, exc)
             problems += 1

@@ -386,21 +386,59 @@ class PayloadTest(unittest.TestCase):
         )
 
 
+class WebhookGoneTest(unittest.TestCase):
+    """How `HomeAssistant.webhook` decides a registration no longer exists."""
+
+    def client(self, answer) -> rhs.HomeAssistant:
+        ha = rhs.HomeAssistant("http://ha.invalid:8123", "t")
+
+        def request(method, path, body=None, authenticated=True):
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        ha._request = request
+        return ha
+
+    def test_an_empty_body_means_the_registration_is_gone(self):
+        # A webhook id Home Assistant does not know answers 200 with nothing in
+        # it -- no 404, no error. Miss that and publishing silently no-ops.
+        with self.assertRaises(rhs.MobileAppGone):
+            self.client(None).webhook("hook", {"type": "update_sensor_states"})
+
+    def test_a_result_object_is_passed_through(self):
+        answer = {"battery_level": {"success": True}}
+        self.assertEqual(self.client(answer).webhook("hook", {"type": "x"}), answer)
+
+    def test_410_still_means_gone(self):
+        gone = rhs.UserError("Home Assistant returned 410 for POST /api/webhook/x: ")
+        with self.assertRaises(rhs.MobileAppGone):
+            self.client(gone).webhook("hook", {"type": "x"})
+
+    def test_any_other_error_is_left_alone(self):
+        boom = rhs.UserError("Home Assistant returned 500 for POST /api/webhook/x: ")
+        with self.assertRaises(rhs.UserError):
+            self.client(boom).webhook("hook", {"type": "x"})
+
+
 class FakeHa:
     """Enough of HomeAssistant to drive the publishing path."""
 
-    def __init__(self, forget=(), gone_once=False):
+    def __init__(self, forget=(), gone_once=False, gone_always=False):
         self.registrations = []
         self.registered = []
         self.updates = []
         self.forget = set(forget)
         self.gone_once = gone_once
+        self.gone_always = gone_always
 
     def register_mobile_app(self, device):
         self.registrations.append(device.name)
         return {"webhook_id": "hook-%d" % len(self.registrations)}
 
     def webhook(self, webhook_id, payload):
+        if self.gone_always:
+            raise rhs.MobileAppGone(webhook_id)
         if self.gone_once:
             self.gone_once = False
             raise rhs.MobileAppGone(webhook_id)
@@ -545,6 +583,17 @@ class PublishBatteriesTest(unittest.TestCase):
         self.assertEqual(rhs.publish_batteries(self.config()), 0)
         after = self.stored()["devices"][airpods]["webhook_id"]
         self.assertNotEqual(before, after)
+
+    def test_a_registration_that_dies_again_is_reported_not_raised(self):
+        # Re-registering is one retry, not a loop, and the failure must stay
+        # inside this device -- the ones after it still get their run, which is
+        # what both names showing up twice proves.
+        self.ha.gone_always = True
+        self.assertEqual(rhs.publish_batteries(self.config()), 1)
+        self.assertEqual(
+            self.ha.registrations,
+            ["Аня’s AirPods Pro 3"] * 2 + ["Magic Mouse"] * 2,
+        )
 
     def test_a_dry_run_writes_nothing(self):
         with contextlib.redirect_stdout(io.StringIO()):
