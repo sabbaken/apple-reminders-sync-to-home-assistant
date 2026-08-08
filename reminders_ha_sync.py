@@ -15,6 +15,7 @@ ones are created on both sides, so there is nothing to map by hand.
     ./reminders_ha_sync.py lists          both sides' lists and how they pair up
     ./reminders_ha_sync.py sync           sync once (what launchd runs)
     ./reminders_ha_sync.py sync --dry-run print what a sync would change
+    ./reminders_ha_sync.py battery        publish battery levels as HA sensors
     ./reminders_ha_sync.py install        install + load the LaunchAgent
     ./reminders_ha_sync.py uninstall      unload + remove it
 
@@ -38,6 +39,7 @@ import shutil
 import ssl
 import subprocess
 import sys
+import termios
 import time
 import urllib.error
 import urllib.parse
@@ -55,6 +57,12 @@ VERSION = "0.2.0"
 SCRIPT_PATH = os.path.abspath(__file__)
 LAUNCH_LABEL = "com.github.sabbaken.reminders-ha-sync"
 
+# Batteries get their own agent rather than riding along with the sync. The
+# Reminders grant breaks on its own schedule -- every `brew upgrade
+# reminders-cli` re-signs the binary out from under TCC, see `signature_check`
+# -- and there is no reason for that to take the battery sensors down too.
+BATTERY_LAUNCH_LABEL = "com.github.sabbaken.reminders-ha-sync-battery"
+
 # Labels this agent used to install under. They have to be booted out and
 # deleted on the way past, or an upgrade leaves the old agent loaded alongside
 # the new one and two syncs race each other over the same state file.
@@ -63,7 +71,14 @@ LEGACY_LAUNCH_LABELS = ("com.github.keith-reminders-ha-sync",)
 
 DEFAULT_CONFIG_PATH = "~/.config/reminders-ha-sync/config.json"
 DEFAULT_STATE_PATH = "~/.local/state/reminders-ha-sync/state.json"
+DEFAULT_BATTERY_STATE_PATH = "~/.local/state/reminders-ha-sync/batteries.json"
 DEFAULT_LOG_PATH = "~/Library/Logs/reminders-ha-sync.log"
+
+# What the mobile_app integration files these registrations under. Changing
+# app_id does not orphan anything by itself -- the webhook ids in batteries.json
+# are what identify a registration -- but it does change how the devices are
+# labelled in Home Assistant.
+MOBILE_APP_ID = "reminders_ha_sync"
 
 REMINDERS_BINARY_CANDIDATES = (
     "/opt/homebrew/bin/reminders",
@@ -76,6 +91,7 @@ REMINDERS_BINARY_CANDIDATES = (
 FIELDS = ("title", "notes", "due", "completed")
 
 STATE_VERSION = 1
+BATTERY_STATE_VERSION = 1
 
 
 class UserError(Exception):
@@ -89,6 +105,19 @@ class RemindersAccessError(UserError):
     type because two very different-looking failures mean the same thing and
     both want the same walkthrough -- see `Reminders.lists`.
     """
+
+
+class MobileAppGone(Exception):
+    """A mobile_app webhook Home Assistant no longer recognises.
+
+    Deleting the device in the UI is the ordinary way to get here, and the
+    ordinary answer is to register again -- so this is recoverable, and not a
+    `UserError`.
+    """
+
+    def __init__(self, webhook_id: str):
+        super().__init__("mobile_app webhook %s is gone" % webhook_id)
+        self.webhook_id = webhook_id
 
 
 # --------------------------------------------------------------------------- #
@@ -297,6 +326,42 @@ class Config:
         self.log_file = expand(str(raw.get("log_file", DEFAULT_LOG_PATH)))
         self.state_file = expand(str(raw.get("state_file", DEFAULT_STATE_PATH)))
         self.reminders_binary = raw.get("reminders_binary") or None
+
+        # Which halves of this are switched on. A config written before
+        # batteries existed has no "features" at all, and must keep meaning
+        # exactly what it meant then: sync on, batteries off. An upgrade that
+        # quietly started registering devices in someone's Home Assistant would
+        # be a nasty surprise.
+        features = raw.get("features", {})
+        if not isinstance(features, dict):
+            raise UserError(
+                "%s: \"features\" must be an object like "
+                "{\"reminders\": true, \"battery\": true}" % path
+            )
+        unknown = sorted(set(features) - {"reminders", "battery"})
+        if unknown:
+            raise UserError(
+                "%s: unknown feature %s -- only \"reminders\" and \"battery\" "
+                "exist" % (path, ", ".join(repr(name) for name in unknown))
+            )
+        self.sync_reminders = bool(features.get("reminders", True))
+        self.sync_battery = bool(features.get("battery", False))
+
+        battery = raw.get("battery", {})
+        if not isinstance(battery, dict):
+            raise UserError("%s: \"battery\" must be an object" % path)
+        self.battery_interval = int(battery.get("interval", 300))
+        self.battery_state_file = expand(
+            str(battery.get("state_file", DEFAULT_BATTERY_STATE_PATH))
+        )
+        battery_exclude = battery.get("exclude", [])
+        if not isinstance(battery_exclude, list):
+            raise UserError(
+                "%s: battery.exclude must be an array of device names" % path
+            )
+        # Matched against the device name macOS reports, folded the same way
+        # list names are.
+        self.battery_exclude = {normalize_name(str(name)) for name in battery_exclude}
 
 
 def expand(path: str) -> str:
@@ -562,14 +627,19 @@ class HomeAssistant:
             context.verify_mode = ssl.CERT_NONE
             self._ssl_context = context
 
-    def _request(self, method: str, path: str, body: object = None) -> object:
+    def _request(
+        self, method: str, path: str, body: object = None, authenticated: bool = True
+    ) -> object:
         url = self.url + path
         data = None
         headers = {"Accept": "application/json"}
         if body is not None:
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"
-        headers["Authorization"] = "Bearer " + self.token
+        # A mobile_app webhook authenticates by its own unguessable id and takes
+        # no token; the id in the path is the credential.
+        if authenticated:
+            headers["Authorization"] = "Bearer " + self.token
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
         LOG.debug("%s %s %s", method, path, json.dumps(body, ensure_ascii=False) if body else "")
         try:
@@ -727,6 +797,60 @@ class HomeAssistant:
             return
         self._service("remove_item", {"entity_id": entity_id, "item": list(uids)})
 
+    # -- mobile_app, which is how the battery sensors get created ----------- #
+
+    def register_mobile_app(self, device: "BatteryDevice") -> dict:
+        """Register one device with mobile_app and return its registration.
+
+        This is the same endpoint the Home Assistant companion app calls. It
+        creates a config entry, and with it a real device in the registry, so
+        the sensors hung off it get unique ids, survive a restart and can be
+        renamed in the UI -- none of which a bare POST to /api/states gets.
+        """
+        registration = self._request(
+            "POST",
+            "/api/mobile_app/registrations",
+            {
+                "device_id": device.key,
+                "app_id": MOBILE_APP_ID,
+                "app_name": "Reminders HA Sync",
+                "app_version": VERSION,
+                "device_name": device.name,
+                "manufacturer": device.manufacturer,
+                "model": device.model,
+                "os_name": device.os_name,
+                "os_version": device.os_version,
+                # Encryption would mean libsodium, and there is no stdlib
+                # equivalent. Declining it is a supported answer: the webhook
+                # then takes plain JSON, which is no worse than every other
+                # call this program already makes over the same connection.
+                "supports_encryption": False,
+            },
+        )
+        if not isinstance(registration, dict) or not registration.get("webhook_id"):
+            raise UserError(
+                "Home Assistant accepted the registration for %s but returned no "
+                "webhook id: %r" % (device.name, registration)
+            )
+        return registration
+
+    def webhook(self, webhook_id: str, payload: dict) -> object:
+        """POST to a mobile_app webhook.
+
+        Raises `MobileAppGone` if Home Assistant no longer knows this
+        registration, which is what deleting the device in the UI looks like
+        from here.
+        """
+        path = "/api/webhook/" + urllib.parse.quote(webhook_id)
+        try:
+            return self._request("POST", path, payload, authenticated=False)
+        except UserError as exc:
+            # 410 is the documented "this webhook is gone"; 404 is what a
+            # deleted registration answers on some versions.
+            if "returned 410" in str(exc) or "returned 404" in str(exc):
+                raise MobileAppGone(webhook_id) from None
+            raise
+
 
 def due_payload(due: Optional[str]) -> dict:
     """Build the due part of a todo service call.
@@ -742,6 +866,689 @@ def due_payload(due: Optional[str]) -> dict:
     # Assistant's cannot silently shift the time.
     local = dt.datetime.fromisoformat(due).astimezone()
     return {"due_datetime": local.isoformat()}
+
+
+# --------------------------------------------------------------------------- #
+# battery sensors: reading macOS
+# --------------------------------------------------------------------------- #
+
+# What a sensor publishes when the reading behind it cannot be trusted -- a
+# disconnected accessory, or a charging flag that could not be attributed.
+# Home Assistant treats these two strings specially whatever the device class,
+# so a numeric sensor can carry one without upsetting the recorder.
+UNAVAILABLE = "unavailable"
+
+# 65535 is what AppleSmartBattery reports for "no estimate yet", which is most
+# of the first few minutes after unplugging.
+NO_ESTIMATE = 65535
+
+
+class Reading:
+    """One sensor to publish: its value now, and how to create it once."""
+
+    def __init__(
+        self,
+        unique_id: str,
+        name: str,
+        state: object,
+        device_class: Optional[str] = None,
+        unit: Optional[str] = None,
+        state_class: Optional[str] = None,
+        binary: bool = False,
+        diagnostic: bool = False,
+    ):
+        self.unique_id = unique_id
+        self.name = name
+        # None means "no reading", which is not the same as zero. Collapsing it
+        # here keeps every caller from having to remember the difference.
+        self.state: object = UNAVAILABLE if state is None else state
+        self.device_class = device_class
+        self.unit = unit
+        self.state_class = state_class
+        # Carried rather than derived from the value, because an unavailable
+        # binary sensor is a string and would otherwise look like a plain one.
+        self.binary = binary
+        self.diagnostic = diagnostic
+
+    @property
+    def kind(self) -> str:
+        return "binary_sensor" if self.binary else "sensor"
+
+    def unavailable(self) -> "Reading":
+        clone = Reading(
+            self.unique_id,
+            self.name,
+            None,
+            self.device_class,
+            self.unit,
+            self.state_class,
+            self.binary,
+            self.diagnostic,
+        )
+        return clone
+
+
+class BatteryDevice:
+    """A physical thing with a battery, and the sensors it publishes.
+
+    One of these becomes one device in Home Assistant, via its own mobile_app
+    registration -- so AirPods land on a card of their own rather than as
+    strays hanging off the Mac.
+    """
+
+    def __init__(
+        self,
+        key: str,
+        name: str,
+        model: str,
+        readings: List[Reading],
+        os_name: str = "macOS",
+        os_version: str = "",
+        manufacturer: str = "Apple",
+        available: bool = True,
+    ):
+        self.key = key
+        self.name = name
+        self.model = model
+        self.readings = readings
+        self.os_name = os_name
+        self.os_version = os_version
+        self.manufacturer = manufacturer
+        self.available = available
+
+    def to_publish(self) -> List[Reading]:
+        """The readings as they should go out.
+
+        A disconnected accessory still reports whatever it last had -- macOS
+        keeps the numbers around indefinitely -- so every one of them is
+        blanked rather than published as though it were current.
+        """
+        if self.available:
+            return self.readings
+        return [reading.unavailable() for reading in self.readings]
+
+
+def parse_percent(value: object) -> Optional[int]:
+    """`"62%"` -> 62. Anything else is no reading at all."""
+    if value is None:
+        return None
+    text = str(value).strip().rstrip("%").strip()
+    try:
+        number = int(round(float(text)))
+    except ValueError:
+        return None
+    return number if 0 <= number <= 100 else None
+
+
+def smart_battery_percent(entry: dict) -> Optional[int]:
+    """Charge as a percentage, on both architectures.
+
+    Apple silicon reports CurrentCapacity as the percentage already, with
+    MaxCapacity pinned at 100. Intel reports both in mAh. Dividing whenever
+    MaxCapacity is not 100 covers the two without having to ask which Mac
+    this is.
+    """
+    current = entry.get("CurrentCapacity")
+    maximum = entry.get("MaxCapacity")
+    if not isinstance(current, int):
+        return None
+    if isinstance(maximum, int) and maximum > 0 and maximum != 100:
+        return int(round(current * 100.0 / maximum))
+    return current if 0 <= current <= 100 else None
+
+
+def smart_battery_health(entry: dict) -> Optional[int]:
+    """The "Maximum Capacity" figure System Settings shows.
+
+    NominalChargeCapacity is the one macOS itself divides by DesignCapacity.
+    AppleRawMaxCapacity is close but consistently a little lower, so it is only
+    a fallback for Macs that do not report the nominal figure.
+    """
+    design = entry.get("DesignCapacity")
+    if not isinstance(design, int) or design <= 0:
+        return None
+    for field in ("NominalChargeCapacity", "AppleRawMaxCapacity"):
+        value = entry.get(field)
+        if isinstance(value, int) and value > 0:
+            return int(round(value * 100.0 / design))
+    return None
+
+
+def smart_battery_minutes(entry: dict) -> Optional[int]:
+    """Minutes to empty, or to full while charging."""
+    charging = bool(entry.get("IsCharging"))
+    for field in ("AvgTimeToFull" if charging else "AvgTimeToEmpty", "TimeRemaining"):
+        value = entry.get(field)
+        if isinstance(value, int) and 0 < value < NO_ESTIMATE:
+            return value
+    return None
+
+
+def mac_readings(entry: dict) -> List[Reading]:
+    """The sensors for the Mac's own battery, from one AppleSmartBattery node."""
+    temperature = entry.get("Temperature")
+    return [
+        Reading(
+            "battery_level",
+            "Battery Level",
+            smart_battery_percent(entry),
+            device_class="battery",
+            unit="%",
+            state_class="measurement",
+        ),
+        Reading(
+            "battery_charging",
+            "Battery Charging",
+            bool(entry.get("IsCharging")),
+            device_class="battery_charging",
+            binary=True,
+        ),
+        Reading(
+            "ac_connected",
+            "AC Connected",
+            bool(entry.get("ExternalConnected")),
+            device_class="plug",
+            binary=True,
+        ),
+        Reading(
+            "battery_full",
+            "Battery Full",
+            bool(entry.get("FullyCharged")),
+            binary=True,
+            diagnostic=True,
+        ),
+        Reading(
+            "battery_health",
+            "Battery Health",
+            smart_battery_health(entry),
+            unit="%",
+            state_class="measurement",
+            diagnostic=True,
+        ),
+        Reading(
+            "battery_cycles",
+            "Battery Cycles",
+            entry.get("CycleCount") if isinstance(entry.get("CycleCount"), int) else None,
+            state_class="total_increasing",
+            diagnostic=True,
+        ),
+        Reading(
+            "battery_temperature",
+            "Battery Temperature",
+            # Hundredths of a degree Celsius.
+            round(temperature / 100.0, 1) if isinstance(temperature, int) else None,
+            device_class="temperature",
+            unit="°C",
+            state_class="measurement",
+            diagnostic=True,
+        ),
+        Reading(
+            "battery_time_remaining",
+            "Battery Time Remaining",
+            smart_battery_minutes(entry),
+            device_class="duration",
+            unit="min",
+            diagnostic=True,
+        ),
+    ]
+
+
+# The three cells an AirPods case reports, and the single one everything else
+# does. Ordered, because that is the order the sensors are created in.
+ACCESSORY_CELLS = (
+    ("device_batteryLevelMain", "battery", "Battery"),
+    ("device_batteryLevelLeft", "left_battery", "Left Battery"),
+    ("device_batteryLevelRight", "right_battery", "Right Battery"),
+    ("device_batteryLevelCase", "case_battery", "Case Battery"),
+)
+
+
+def accessory_readings(info: dict) -> List[Reading]:
+    """Level and charging sensors for whichever cells this device reports.
+
+    The charging flags start out unknown: nothing in the Bluetooth data says
+    so, and they are filled in afterwards from pmset -- see
+    `attribute_charging`.
+    """
+    readings: List[Reading] = []
+    for field, prefix, label in ACCESSORY_CELLS:
+        percent = parse_percent(info.get(field))
+        if percent is None:
+            continue
+        readings.append(
+            Reading(
+                prefix + "_level",
+                label + " Level",
+                percent,
+                device_class="battery",
+                unit="%",
+                state_class="measurement",
+            )
+        )
+        readings.append(
+            Reading(
+                prefix + "_charging",
+                label + " Charging",
+                None,
+                device_class="battery_charging",
+                binary=True,
+            )
+        )
+    return readings
+
+
+def parse_bluetooth(payload: object) -> List[BatteryDevice]:
+    """Battery-reporting Bluetooth devices, from `system_profiler` JSON.
+
+    Both the connected and the disconnected are returned; a disconnected one is
+    marked unavailable rather than dropped, so a device that has been
+    registered once keeps saying so instead of silently freezing at its last
+    reading.
+    """
+    devices: List[BatteryDevice] = []
+    sections = payload.get("SPBluetoothDataType", []) if isinstance(payload, dict) else []
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        for group, connected in (
+            ("device_connected", True),
+            ("device_not_connected", False),
+        ):
+            for record in section.get(group, []) or []:
+                if not isinstance(record, dict):
+                    continue
+                for name, info in record.items():
+                    if not isinstance(info, dict):
+                        continue
+                    readings = accessory_readings(info)
+                    if not readings:
+                        continue
+                    address = str(info.get("device_address") or name)
+                    devices.append(
+                        BatteryDevice(
+                            key="bt-" + address.replace(":", "").lower(),
+                            name=str(name),
+                            model=str(info.get("device_minorType") or "Bluetooth device"),
+                            readings=readings,
+                            os_name="Bluetooth",
+                            os_version=str(info.get("device_firmwareVersion") or ""),
+                            available=connected,
+                        )
+                    )
+    return devices
+
+
+def parse_accessory_charging(text: str) -> Dict[int, Optional[bool]]:
+    """Charge percentage -> charging, from `pmset -g accps`.
+
+    Percentage is the only join available. pmset knows which accessory cells
+    are charging but names none of them; system_profiler names them all but
+    says nothing about charging; and no third source has both -- ioreg carries
+    no BatteryPercent for these at all. So two cells sitting on the same
+    percentage are genuinely ambiguous, and both map to None rather than to a
+    guess that would be wrong half the time.
+    """
+    charging: Dict[int, Optional[bool]] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        # The Mac's own battery is on this list too and is not an accessory.
+        if not line.startswith("-") or "InternalBattery" in line:
+            continue
+        fields = [chunk.strip() for chunk in line.split(";")]
+        percent = None
+        for chunk in fields[0].split():
+            if chunk.endswith("%"):
+                percent = parse_percent(chunk)
+                break
+        if percent is None:
+            continue
+        state = fields[1].lower() if len(fields) > 1 else ""
+        if percent in charging:
+            charging[percent] = None  # ambiguous, and it stays that way
+        else:
+            charging[percent] = "charging" in state and "discharging" not in state
+    return charging
+
+
+def attribute_charging(
+    devices: Iterable[BatteryDevice], charging: Dict[int, Optional[bool]]
+) -> None:
+    """Fill in accessory charging flags by matching on percentage."""
+    for device in devices:
+        levels = {
+            reading.unique_id[: -len("_level")]: reading.state
+            for reading in device.readings
+            if reading.unique_id.endswith("_level")
+        }
+        for reading in device.readings:
+            if not reading.unique_id.endswith("_charging"):
+                continue
+            level = levels.get(reading.unique_id[: -len("_charging")])
+            if isinstance(level, int):
+                state = charging.get(level)
+                reading.state = UNAVAILABLE if state is None else state
+
+
+def run_command(cmd: Sequence[str], parse_plist: bool = False) -> object:
+    """Run a read-only macOS query. Returns None if it is not answerable."""
+    LOG.debug("$ %s", " ".join(cmd))
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as exc:
+        LOG.debug("%s is not available: %s", cmd[0], exc)
+        return None
+    if proc.returncode != 0:
+        LOG.debug(
+            "`%s` exited %d: %s",
+            " ".join(cmd),
+            proc.returncode,
+            proc.stderr.decode("utf-8", "replace").strip()[:200],
+        )
+        return None
+    if parse_plist:
+        try:
+            return plistlib.loads(proc.stdout)
+        except Exception as exc:  # a truncated or empty plist
+            LOG.debug("cannot parse the plist from `%s`: %s", " ".join(cmd), exc)
+            return None
+    return proc.stdout.decode("utf-8", "replace")
+
+
+def ioreg_class(name: str) -> Optional[dict]:
+    entries = run_command(["ioreg", "-r", "-c", name, "-d1", "-a"], parse_plist=True)
+    if isinstance(entries, list) and entries and isinstance(entries[0], dict):
+        return entries[0]
+    return None
+
+
+def mac_battery_device() -> Optional[BatteryDevice]:
+    """The Mac itself, or None on a desktop with no battery."""
+    entry = ioreg_class("AppleSmartBattery")
+    if entry is None or not entry.get("BatteryInstalled"):
+        return None
+    platform = ioreg_class("IOPlatformExpertDevice") or {}
+    # The hardware UUID is stable across renames and reinstalls, which is what
+    # keeps a registration attached to this Mac rather than to its current name.
+    uuid = str(platform.get("IOPlatformUUID") or "")
+    name = (run_command(["scutil", "--get", "ComputerName"]) or "").strip() or "Mac"
+    model = (run_command(["sysctl", "-n", "hw.model"]) or "").strip() or "Mac"
+    version = (run_command(["sw_vers", "-productVersion"]) or "").strip()
+    return BatteryDevice(
+        key="mac-" + (uuid or model),
+        name=name,
+        model=model,
+        readings=mac_readings(entry),
+        os_name="macOS",
+        os_version=version,
+    )
+
+
+def collect_battery_devices(exclude: Optional[Set[str]] = None) -> List[BatteryDevice]:
+    """Everything on this Mac that reports a battery."""
+    devices: List[BatteryDevice] = []
+    mac = mac_battery_device()
+    if mac is not None:
+        devices.append(mac)
+
+    raw = run_command(["system_profiler", "SPBluetoothDataType", "-json"])
+    if raw:
+        try:
+            accessories = parse_bluetooth(json.loads(raw))
+        except json.JSONDecodeError as exc:
+            LOG.warning("cannot parse the Bluetooth data: %s", exc)
+            accessories = []
+        attribute_charging(
+            accessories, parse_accessory_charging(run_command(["pmset", "-g", "accps"]) or "")
+        )
+        devices.extend(accessories)
+
+    excluded = exclude or set()
+    return [device for device in devices if normalize_name(device.name) not in excluded]
+
+
+# --------------------------------------------------------------------------- #
+# battery sensors: publishing
+# --------------------------------------------------------------------------- #
+
+
+class BatteryStore:
+    """Which devices have been registered with Home Assistant, and as what.
+
+    Kept apart from `state.json` on purpose: that file is the sync's snapshot
+    of what the two sides agreed on, and a corrupt or discarded battery
+    registration must never be able to cost anyone their to-do links.
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self.data: Dict[str, object] = {
+            "version": BATTERY_STATE_VERSION,
+            "devices": {},
+            "last_publish": None,
+        }
+        if os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    loaded = json.load(fh)
+                if isinstance(loaded, dict) and loaded.get("version") == BATTERY_STATE_VERSION:
+                    self.data = loaded
+                else:
+                    LOG.warning(
+                        "ignoring battery state file %s: unexpected version %r",
+                        path,
+                        (loaded or {}).get("version"),
+                    )
+            except (json.JSONDecodeError, OSError) as exc:
+                LOG.warning("ignoring unreadable battery state file %s: %s", path, exc)
+        self.data.setdefault("devices", {})
+
+    @property
+    def devices(self) -> Dict[str, dict]:
+        return self.data["devices"]  # type: ignore[return-value]
+
+    def registration(self, key: str) -> Optional[dict]:
+        entry = self.devices.get(key)
+        if isinstance(entry, dict) and entry.get("webhook_id"):
+            entry.setdefault("sensors", {})
+            return entry
+        return None
+
+    def remember(self, key: str, webhook_id: str, name: str) -> dict:
+        # sensors maps unique_id -> "sensor" | "binary_sensor". The kind is
+        # remembered rather than recomputed because a sensor that has stopped
+        # reporting still has to be updated -- see `publish_device` -- and by
+        # then there is no reading left to ask.
+        entry: Dict[str, object] = {"webhook_id": webhook_id, "name": name, "sensors": {}}
+        self.devices[key] = entry
+        return entry
+
+    def forget(self, key: str) -> None:
+        self.devices.pop(key, None)
+
+    def save(self) -> None:
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        temporary = self.path + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as fh:
+            json.dump(self.data, fh, indent=2, ensure_ascii=False, sort_keys=True)
+            fh.write("\n")
+        os.replace(temporary, self.path)
+        # The webhook ids in here are credentials: anyone holding one can write
+        # states into this Home Assistant.
+        os.chmod(self.path, 0o600)
+
+
+def register_payload(reading: Reading) -> dict:
+    data: Dict[str, object] = {
+        "type": reading.kind,
+        "unique_id": reading.unique_id,
+        "name": reading.name,
+        "state": reading.state,
+    }
+    if reading.device_class:
+        data["device_class"] = reading.device_class
+    if reading.unit:
+        data["unit_of_measurement"] = reading.unit
+    if reading.state_class:
+        data["state_class"] = reading.state_class
+    if reading.diagnostic:
+        data["entity_category"] = "diagnostic"
+    return data
+
+
+def update_payload(reading: Reading) -> dict:
+    return {
+        "type": reading.kind,
+        "unique_id": reading.unique_id,
+        "state": reading.state,
+    }
+
+
+def stale_payloads(known: Dict[str, str], readings: List[Reading]) -> List[dict]:
+    """Updates for sensors that exist in Home Assistant but reported nothing.
+
+    An AirPods case only appears in the Bluetooth data while the lid is open,
+    and a cell that stops being reported would otherwise keep its last value
+    forever -- a case that reads 62% for a month because that is what it held
+    when it was last seen. Blanking them is the honest answer.
+    """
+    live = {reading.unique_id for reading in readings}
+    return [
+        {"type": kind, "unique_id": unique_id, "state": UNAVAILABLE}
+        for unique_id, kind in sorted(known.items())
+        if unique_id not in live
+    ]
+
+
+def publish_device(
+    ha: HomeAssistant, entry: dict, device: BatteryDevice, readings: List[Reading]
+) -> None:
+    """Create whatever is missing, then push every value in one call."""
+    webhook_id = str(entry["webhook_id"])
+    known: Dict[str, str] = dict(entry.get("sensors") or {})
+
+    def register(subset: List[Reading]) -> None:
+        for reading in subset:
+            ha.webhook(
+                webhook_id,
+                {"type": "register_sensor", "data": register_payload(reading)},
+            )
+            known[reading.unique_id] = reading.kind
+            entry["sensors"] = dict(known)
+
+    register([reading for reading in readings if reading.unique_id not in known])
+
+    result = ha.webhook(
+        webhook_id,
+        {
+            "type": "update_sensor_states",
+            "data": [update_payload(reading) for reading in readings]
+            + stale_payloads(known, readings),
+        },
+    )
+
+    # Home Assistant answers per sensor, and a sensor it has forgotten -- a
+    # deleted entity, a restored backup -- comes back not_registered rather
+    # than failing the call. Registering it again here means the next run does
+    # not have to be the one that fixes it.
+    missing = [
+        reading
+        for reading in readings
+        if isinstance(result, dict)
+        and isinstance(result.get(reading.unique_id), dict)
+        and not result[reading.unique_id].get("success")
+        and (result[reading.unique_id].get("error") or {}).get("code") == "not_registered"
+    ]
+    if not missing:
+        return
+    LOG.info(
+        "%s: re-registering %d sensor(s) Home Assistant had forgotten",
+        device.name,
+        len(missing),
+    )
+    for reading in missing:
+        known.pop(reading.unique_id, None)
+    register(missing)
+    ha.webhook(
+        webhook_id,
+        {
+            "type": "update_sensor_states",
+            "data": [update_payload(reading) for reading in missing],
+        },
+    )
+
+
+def publish_batteries(config: Config, dry_run: bool = False) -> int:
+    """Push every battery reading on this Mac into Home Assistant."""
+    devices = collect_battery_devices(config.battery_exclude)
+    if not devices:
+        LOG.warning("no device on this Mac reports a battery")
+        return 0
+
+    store = BatteryStore(config.battery_state_file)
+    ha = HomeAssistant(
+        config.ha_url, config.ha_token, config.ha_timeout, config.ha_verify_tls
+    )
+    problems = 0
+    published = 0
+
+    for device in devices:
+        readings = device.to_publish()
+        entry = store.registration(device.key)
+
+        if entry is None and not device.available:
+            # Registering a device that is not here would create a card of
+            # permanently unavailable sensors for every accessory that has ever
+            # been paired with this Mac. It gets picked up the first time it
+            # actually connects.
+            LOG.debug("skipping %s: not connected and not registered yet", device.name)
+            if dry_run:
+                print(
+                    "%s (%s) -- not connected, nothing created until it is"
+                    % (device.name, device.model)
+                )
+            continue
+
+        if dry_run:
+            print("%s (%s)%s" % (device.name, device.model, "" if device.available else " -- disconnected"))
+            for reading in readings:
+                print("    %-24s %s" % (reading.unique_id, reading.state))
+            print("    %s" % ("already registered" if entry else "would be registered"))
+            continue
+
+        try:
+            if entry is None:
+                LOG.info("registering %s with Home Assistant", device.name)
+                registration = ha.register_mobile_app(device)
+                entry = store.remember(
+                    device.key, str(registration["webhook_id"]), device.name
+                )
+            try:
+                publish_device(ha, entry, device, readings)
+            except MobileAppGone:
+                # The device was deleted in Home Assistant. Registering again
+                # is what the user asked for by leaving the feature switched on.
+                LOG.info("%s was removed in Home Assistant; registering again", device.name)
+                store.forget(device.key)
+                registration = ha.register_mobile_app(device)
+                entry = store.remember(
+                    device.key, str(registration["webhook_id"]), device.name
+                )
+                publish_device(ha, entry, device, readings)
+        except UserError as exc:
+            LOG.error("%s: %s", device.name, exc)
+            problems += 1
+            continue
+        published += 1
+
+    if not dry_run:
+        store.data["last_publish"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        store.save()
+        LOG.info(
+            "published %d device(s)%s",
+            published,
+            ", %d failed" % problems if problems else "",
+        )
+    return 1 if problems else 0
 
 
 # --------------------------------------------------------------------------- #
@@ -1620,19 +2427,28 @@ def cmd_doctor(config: Config) -> int:
         if not ok:
             problems += 1
 
+    enabled = [
+        name
+        for name, on in (("reminders", config.sync_reminders), ("battery", config.sync_battery))
+        if on
+    ]
     print("version     %s" % VERSION)
     print("script      %s" % SCRIPT_PATH)
     print("config      %s" % config.path)
+    print("features    %s" % (", ".join(enabled) or "none -- nothing will run"))
     print("state       %s" % config.state_file)
     print("log         %s" % config.log_file)
     print("python      %s" % sys.version.split()[0])
     print()
 
     reminders: Optional[Reminders] = None
-    try:
-        reminders = Reminders(config.reminders_binary)
-    except UserError as exc:
-        check("reminders-cli", False, str(exc).splitlines()[0])
+    if not config.sync_reminders:
+        print("--   reminders sync is switched off in the config")
+    else:
+        try:
+            reminders = Reminders(config.reminders_binary)
+        except UserError as exc:
+            check("reminders-cli", False, str(exc).splitlines()[0])
 
     if reminders is not None:
         print("reminders   %s" % reminders.binary)
@@ -1695,6 +2511,39 @@ def cmd_doctor(config: Config) -> int:
             % (key, len(state.get("links", [])), state.get("last_sync") or "never")
         )
 
+    if config.sync_battery:
+        print()
+        batteries = BatteryStore(config.battery_state_file)
+        print("batteries   %s" % config.battery_state_file)
+        print(
+            "batteries   last published %s"
+            % (batteries.data.get("last_publish") or "never")
+        )
+        found = collect_battery_devices(config.battery_exclude)
+        if not found:
+            check("battery sources", False, "nothing on this Mac reports a battery")
+        for device in found:
+            registration = batteries.registration(device.key)
+            print(
+                "  %-28s %-11s %s"
+                % (
+                    device.name[:28],
+                    "connected" if device.available else "away",
+                    "%d sensors" % len(registration.get("sensors") or {})
+                    if registration
+                    else "not registered yet",
+                )
+            )
+        # A registration whose device is nowhere to be seen is not a fault --
+        # AirPods live in a pocket -- but it does explain unavailable entities.
+        keys = {device.key for device in found}
+        for key, entry in sorted(batteries.devices.items()):
+            if key not in keys:
+                print(
+                    "  %-28s %-11s %s"
+                    % (str(entry.get("name") or key)[:28], "gone", "still registered")
+                )
+
     print()
     plist = launch_agent_path()
     if os.path.exists(plist):
@@ -1704,8 +2553,37 @@ def cmd_doctor(config: Config) -> int:
             stderr=subprocess.DEVNULL,
         )
         check("LaunchAgent loaded", loaded.returncode == 0, plist)
-    else:
+        if not config.sync_reminders:
+            # Switched off in the config but still on a schedule: the agent
+            # goes on syncing, which is exactly what switching it off meant to
+            # stop.
+            check(
+                "sync LaunchAgent installed but the feature is off",
+                False,
+                "`%s install` removes it" % os.path.basename(SCRIPT_PATH),
+            )
+    elif config.sync_reminders:
         print("--   LaunchAgent not installed (run `%s install`)" % os.path.basename(SCRIPT_PATH))
+
+    battery_plist = launch_agent_path(BATTERY_LAUNCH_LABEL)
+    if os.path.exists(battery_plist):
+        loaded = subprocess.run(
+            ["launchctl", "print", "gui/%d/%s" % (os.getuid(), BATTERY_LAUNCH_LABEL)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        check("battery LaunchAgent loaded", loaded.returncode == 0, battery_plist)
+        if not config.sync_battery:
+            check(
+                "battery LaunchAgent installed but the feature is off",
+                False,
+                "`%s install` removes it" % os.path.basename(SCRIPT_PATH),
+            )
+    elif config.sync_battery:
+        print(
+            "--   battery LaunchAgent not installed (run `%s install`)"
+            % os.path.basename(SCRIPT_PATH)
+        )
 
     # Either the agent predates the rename and is still the live one, or both
     # are loaded and syncing the same pairs on two schedules. Both want the
@@ -1781,6 +2659,132 @@ def ask_secret(question: str) -> str:
     return getpass.getpass(question + ": ").strip()
 
 
+CHECKED = "[x]"
+UNCHECKED = "[ ]"
+
+
+def render_checklist(
+    options: Sequence[Tuple[str, str]], selected: Sequence[bool], cursor: int
+) -> List[str]:
+    width = max(len(label) for label, _ in options)
+    return [
+        "%s %s %-*s  %s"
+        % (
+            ">" if index == cursor else " ",
+            CHECKED if selected[index] else UNCHECKED,
+            width,
+            label,
+            description,
+        )
+        for index, (label, description) in enumerate(options)
+    ]
+
+
+def checklist_by_number(
+    title: str, options: Sequence[Tuple[str, str]], selected: List[bool]
+) -> List[bool]:
+    """The checklist as plain question and answer, for terminals that cannot
+    do better -- or for a run that has no terminal at all."""
+    while True:
+        print()
+        print(title)
+        for index, line in enumerate(render_checklist(options, selected, -1), 1):
+            print(" %2d.%s" % (index, line[1:]))
+        answer = ask("Numbers to toggle (comma-separated, Enter to accept)")
+        if not answer:
+            return selected
+        for chunk in answer.replace(" ", "").split(","):
+            if not chunk:
+                continue
+            try:
+                index = int(chunk)
+            except ValueError:
+                print("! ignoring %r, that is not a number" % chunk)
+                continue
+            if not 1 <= index <= len(options):
+                print("! ignoring %d, out of range" % index)
+                continue
+            selected[index - 1] = not selected[index - 1]
+
+
+def apply_checklist_key(
+    key: bytes, cursor: int, chosen: List[bool]
+) -> Tuple[int, bool]:
+    """One keypress against the checklist. Returns (cursor, accepted).
+
+    Split out from the drawing so it can be tested without a terminal -- which
+    matters, because /dev/tty is exactly what a test does not have.
+    """
+    count = len(chosen)
+    if key in (b"\x1b[A", b"k"):
+        return (cursor - 1) % count, False
+    if key in (b"\x1b[B", b"j"):
+        return (cursor + 1) % count, False
+    if key == b" ":
+        chosen[cursor] = not chosen[cursor]
+        return cursor, False
+    if key in (b"\r", b"\n"):
+        return cursor, True
+    if key == b"\x03":
+        raise KeyboardInterrupt
+    return cursor, False
+
+
+def ask_checklist(
+    title: str, options: Sequence[Tuple[str, str]], selected: Sequence[bool]
+) -> List[bool]:
+    """Tick features on and off with the arrow keys.
+
+    Falls back to typing numbers whenever the terminal cannot be put into
+    cbreak mode, which covers a pipe, a CI job and anything exotic. Reads
+    /dev/tty rather than stdin for the reason `ask` does: the installer can
+    arrive down a pipe with stdin already spoken for.
+    """
+    chosen = list(selected)
+    try:
+        tty = open("/dev/tty", "r+")
+    except OSError:
+        return checklist_by_number(title, options, chosen)
+
+    with tty:
+        fd = tty.fileno()
+        try:
+            original = termios.tcgetattr(fd)
+        except termios.error:
+            return checklist_by_number(title, options, chosen)
+
+        cursor = 0
+        hint = "  up/down move, space toggles, enter accepts"
+        try:
+            # cbreak rather than raw: signals keep working, so Ctrl-C still
+            # interrupts even while the keyboard is being read a byte at a time.
+            new = termios.tcgetattr(fd)
+            new[3] &= ~(termios.ICANON | termios.ECHO)  # lflags
+            new[6][termios.VMIN] = 1
+            new[6][termios.VTIME] = 0
+            termios.tcsetattr(fd, termios.TCSADRAIN, new)
+
+            tty.write("\n" + title + "\n" + hint + "\n\n")
+            drawn = 0
+            while True:
+                if drawn:
+                    tty.write("\x1b[%dA" % drawn)  # back to the top of the list
+                for line in render_checklist(options, chosen, cursor):
+                    tty.write("\x1b[2K" + line + "\n")
+                drawn = len(options)
+                tty.flush()
+
+                # An arrow arrives as three bytes in one go, so one read is
+                # always a whole keypress.
+                cursor, accepted = apply_checklist_key(os.read(fd, 3), cursor, chosen)
+                if accepted:
+                    break
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, original)
+        tty.write("\n")
+    return chosen
+
+
 def confirm(question: str, default: bool = True) -> bool:
     hint = "Y/n" if default else "y/N"
     while True:
@@ -1811,6 +2815,18 @@ def wait_for_reminders_access(reminders: Reminders) -> List[str]:
                 ) from None
 
 
+def parse_features(value: str) -> Tuple[bool, bool]:
+    """`--features reminders,battery` -> (True, True). "none" turns both off."""
+    names = {chunk.strip().lower() for chunk in value.split(",") if chunk.strip()}
+    unknown = sorted(names - {"reminders", "battery", "none"})
+    if unknown:
+        raise UserError(
+            "unknown feature %s -- expected \"reminders\", \"battery\" or both"
+            % ", ".join(repr(name) for name in unknown)
+        )
+    return "reminders" in names, "battery" in names
+
+
 def cmd_setup(config_path: str, args: argparse.Namespace) -> int:
     """Ask the handful of questions a working config needs, then install."""
     full_path = expand(config_path)
@@ -1823,17 +2839,44 @@ def cmd_setup(config_path: str, args: argparse.Namespace) -> int:
             existing = {}
     previous = existing.get("home_assistant") or {}
 
-    print("Setting up the Reminders <-> Home Assistant sync.")
+    print("Setting up reminders-ha-sync.")
     print("Config will be written to %s" % full_path)
+
+    # -- what should run --------------------------------------------------- #
+
+    stored = existing.get("features")
+    stored = stored if isinstance(stored, dict) else {}
+    want_reminders = bool(stored.get("reminders", True))
+    want_battery = bool(stored.get("battery", False))
+
+    if args.features is not None:
+        want_reminders, want_battery = parse_features(args.features)
+    elif not args.yes:
+        want_reminders, want_battery = ask_checklist(
+            "What should run?",
+            (
+                ("Reminders sync", "two-way sync between Reminders and to-do lists"),
+                ("Battery sensors", "this Mac, AirPods, and other Bluetooth devices"),
+            ),
+            # A config that does not exist yet offers both. One that does
+            # offers back exactly what it already says, so re-running setup
+            # can never switch something on behind the user's back.
+            [want_reminders, True if not existing else want_battery],
+        )
+
+    if not want_reminders and not want_battery:
+        raise UserError(
+            "nothing was selected, so there is nothing to set up. Pick at "
+            "least one."
+        )
     print()
 
-    reminders = Reminders(args.reminders_binary)
-    if args.yes:
-        r_lists = reminders.lists()
-    else:
-        r_lists = wait_for_reminders_access(reminders)
-    print("Reminders: %d lists (%s)" % (len(r_lists), ", ".join(r_lists)))
-    print()
+    reminders: Optional[Reminders] = None
+    if want_reminders:
+        reminders = Reminders(args.reminders_binary)
+        r_lists = reminders.lists() if args.yes else wait_for_reminders_access(reminders)
+        print("Reminders: %d lists (%s)" % (len(r_lists), ", ".join(r_lists)))
+        print()
 
     # -- Home Assistant ---------------------------------------------------- #
 
@@ -1886,78 +2929,135 @@ def cmd_setup(config_path: str, args: argparse.Namespace) -> int:
 
     raw = dict(existing)
     raw["home_assistant"] = dict(previous, url=url.rstrip("/"), token=token)
+    raw["features"] = {"reminders": want_reminders, "battery": want_battery}
     write_config(full_path, raw)
 
     # -- show the plan, offer to trim it ----------------------------------- #
 
     config = Config(raw, full_path)
-    pairing = resolve_pairs(config, reminders, ha, create=False)
-    # Only rows that would actually be synced can be opted out of, so those are
-    # the ones that get numbers.
-    choices = [row for row in pairing.plan if row[2] != "excluded"]
-    skipped = [row for row in pairing.plan if row[2] == "excluded"]
 
-    if choices:
-        print("Here is what a sync would do:")
-        print()
-        for index, (list_name, entity_id, note) in enumerate(choices, 1):
-            print("  %2d. %-26s %-26s %s" % (index, list_name, entity_id, note))
-        if skipped:
+    if reminders is not None:
+        pairing = resolve_pairs(config, reminders, ha, create=False)
+        # Only rows that would actually be synced can be opted out of, so those
+        # are the ones that get numbers.
+        choices = [row for row in pairing.plan if row[2] != "excluded"]
+        skipped = [row for row in pairing.plan if row[2] == "excluded"]
+
+        if choices:
+            print("Here is what a sync would do:")
             print()
-            print("  already excluded: %s" % ", ".join(row[0] if row[0] != "-" else row[1] for row in skipped))
-        print()
-
-        if not args.yes:
-            answer = ask("Numbers to leave out (comma-separated, Enter to sync all)")
-            excluded = []
-            for chunk in answer.replace(" ", "").split(","):
-                if not chunk:
-                    continue
-                try:
-                    index = int(chunk)
-                except ValueError:
-                    print("! ignoring %r, that is not a number" % chunk)
-                    continue
-                if not 1 <= index <= len(choices):
-                    print("! ignoring %d, out of range" % index)
-                    continue
-                list_name, entity_id, _ = choices[index - 1]
-                excluded.append(list_name if list_name != "-" else entity_id)
-            if excluded:
-                raw["exclude"] = sorted(set(list(raw.get("exclude") or []) + excluded))
-                write_config(full_path, raw)
-                config = Config(raw, full_path)
-                print("Excluded: %s" % ", ".join(excluded))
+            for index, (list_name, entity_id, note) in enumerate(choices, 1):
+                print("  %2d. %-26s %-26s %s" % (index, list_name, entity_id, note))
+            if skipped:
+                print()
+                print("  already excluded: %s" % ", ".join(row[0] if row[0] != "-" else row[1] for row in skipped))
             print()
-    else:
-        print("Nothing to sync: every list is excluded.")
-        print()
 
-    for problem in pairing.problems:
-        print("! %s" % problem)
+            if not args.yes:
+                answer = ask("Numbers to leave out (comma-separated, Enter to sync all)")
+                excluded = []
+                for chunk in answer.replace(" ", "").split(","):
+                    if not chunk:
+                        continue
+                    try:
+                        index = int(chunk)
+                    except ValueError:
+                        print("! ignoring %r, that is not a number" % chunk)
+                        continue
+                    if not 1 <= index <= len(choices):
+                        print("! ignoring %d, out of range" % index)
+                        continue
+                    list_name, entity_id, _ = choices[index - 1]
+                    excluded.append(list_name if list_name != "-" else entity_id)
+                if excluded:
+                    raw["exclude"] = sorted(set(list(raw.get("exclude") or []) + excluded))
+                    write_config(full_path, raw)
+                    config = Config(raw, full_path)
+                    print("Excluded: %s" % ", ".join(excluded))
+                print()
+        else:
+            print("Nothing to sync: every list is excluded.")
+            print()
+
+        for problem in pairing.problems:
+            print("! %s" % problem)
+
+    # -- what the battery side found --------------------------------------- #
+
+    if want_battery:
+        devices = collect_battery_devices(config.battery_exclude)
+        if devices:
+            print("Battery sensors will be published for:")
+            for device in devices:
+                print(
+                    "  %-30s %s"
+                    % (
+                        device.name[:30],
+                        "%d sensors" % len(device.readings)
+                        if device.available
+                        # Nothing is created for these until they turn up, so
+                        # Home Assistant does not fill with dead cards.
+                        else "not connected -- will appear once it is",
+                    )
+                )
+        else:
+            print("! Nothing on this Mac reports a battery.")
+        print()
 
     # -- background it ----------------------------------------------------- #
 
     interval = args.interval
+    battery_interval = args.battery_interval
     if not args.yes:
-        interval = int(ask("Sync every how many seconds", str(interval)) or interval)
+        if want_reminders:
+            interval = int(ask("Sync every how many seconds", str(interval)) or interval)
+        if want_battery:
+            battery_interval = int(
+                ask("Publish batteries every how many seconds", str(battery_interval))
+                or battery_interval
+            )
+
+    if want_battery:
+        battery_raw = raw.get("battery")
+        battery_raw = dict(battery_raw) if isinstance(battery_raw, dict) else {}
+        battery_raw["interval"] = battery_interval
+        raw["battery"] = battery_raw
+        write_config(full_path, raw)
+        config = Config(raw, full_path)
 
     if args.no_sync:
-        print("Config written. Nothing has been synced and nothing installed.")
+        print("Config written. Nothing has run and nothing has been installed.")
         print()
         print("Look before you leap:")
-        print("    %s sync --dry-run" % SCRIPT_PATH)
+        if want_reminders:
+            print("    %s sync --dry-run" % SCRIPT_PATH)
+        if want_battery:
+            print("    %s battery --dry-run" % SCRIPT_PATH)
         return 0
 
     if args.no_install:
-        print("Syncing once, without installing the LaunchAgent...")
-        result = sync_once(config)
+        result = 0
+        if want_reminders:
+            print("Syncing once, without installing the LaunchAgent...")
+            result = sync_once(config)
+        if want_battery:
+            print("Publishing batteries once, without installing the LaunchAgent...")
+            result = publish_batteries(config) or result
         print()
-        print("Sync from now on with:")
-        print("    %s sync" % SCRIPT_PATH)
+        print("From now on, run:")
+        if want_reminders:
+            print("    %s sync" % SCRIPT_PATH)
+        if want_battery:
+            print("    %s battery" % SCRIPT_PATH)
         return result
 
-    if not args.yes and not confirm("Sync now and start syncing every %ds" % interval):
+    schedule = []
+    if want_reminders:
+        schedule.append("sync every %ds" % interval)
+    if want_battery:
+        schedule.append("publish batteries every %ds" % battery_interval)
+
+    if not args.yes and not confirm("Start now, and " + " and ".join(schedule)):
         print()
         print("Nothing installed. When you are ready:")
         print("    %s install --interval %d" % (SCRIPT_PATH, interval))
@@ -1966,6 +3066,11 @@ def cmd_setup(config_path: str, args: argparse.Namespace) -> int:
     print()
     result = cmd_install(config, interval)
     if result == 0:
+        if want_battery:
+            # cmd_install seeds the sync but not the batteries, and waiting a
+            # whole interval to find out whether it works is a poor first
+            # impression.
+            publish_batteries(config)
         print()
         print("Done. Check on it any time with:")
         print("    %s doctor" % SCRIPT_PATH)
@@ -2000,44 +3105,25 @@ def launchd_python() -> str:
     return sys.executable
 
 
-def cmd_install(config: Config, interval: int, initial_sync: bool = True) -> int:
-    # Seed in the foreground before handing over to launchd. In auto mode the
-    # first run can create a lot of lists, and watching it happen beats
-    # discovering it in a log afterwards -- and if it fails, nothing is loaded.
-    if initial_sync:
-        print("running the first sync...")
-        if sync_once(config) != 0:
-            raise UserError(
-                "the first sync reported problems, so the LaunchAgent was not "
-                "installed. Fix them, or re-run with --skip-initial-sync."
-            )
-        print()
-
-    # Before writing the new one: an agent installed under the old label would
-    # otherwise stay loaded and sync the same pairs on its own schedule.
-    drop_legacy_launch_agents()
-
-    plist_path = launch_agent_path()
+def install_launch_agent(
+    label: str, command: Sequence[str], interval: int, log_file: str
+) -> str:
+    """Write one plist and load it. Returns the path it was written to."""
+    plist_path = launch_agent_path(label)
     os.makedirs(os.path.dirname(plist_path), exist_ok=True)
-    os.makedirs(os.path.dirname(config.log_file), exist_ok=True)
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
 
     plist = {
-        "Label": LAUNCH_LABEL,
-        "ProgramArguments": [
-            launchd_python(),
-            SCRIPT_PATH,
-            "--config",
-            config.path,
-            "sync",
-        ],
+        "Label": label,
+        "ProgramArguments": [launchd_python(), SCRIPT_PATH] + list(command),
         "StartInterval": interval,
         "RunAtLoad": True,
         "ProcessType": "Background",
         # Aqua only: the Reminders permission prompt can only appear in a GUI
         # session, and a background-session job would just be denied.
         "LimitLoadToSessionType": "Aqua",
-        "StandardOutPath": config.log_file,
-        "StandardErrorPath": config.log_file,
+        "StandardOutPath": log_file,
+        "StandardErrorPath": log_file,
         "EnvironmentVariables": {"LANG": "en_US.UTF-8"},
     }
     with open(plist_path, "wb") as fh:
@@ -2045,7 +3131,7 @@ def cmd_install(config: Config, interval: int, initial_sync: bool = True) -> int
 
     target = "gui/%d" % os.getuid()
     subprocess.run(
-        ["launchctl", "bootout", target + "/" + LAUNCH_LABEL],
+        ["launchctl", "bootout", target + "/" + label],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -2059,25 +3145,74 @@ def cmd_install(config: Config, interval: int, initial_sync: bool = True) -> int
         raise UserError(
             "launchctl bootstrap failed: %s" % (result.stdout or "").strip()
         )
+    return plist_path
 
-    print("installed %s" % plist_path)
-    print("syncing every %d seconds; log: %s" % (interval, config.log_file))
+
+def cmd_install(config: Config, interval: int, initial_sync: bool = True) -> int:
+    if not config.sync_reminders and not config.sync_battery:
+        raise UserError(
+            "both features are switched off in %s, so there is nothing to "
+            "install. Enable one under \"features\", or re-run `%s setup`."
+            % (config.path, os.path.basename(SCRIPT_PATH))
+        )
+
+    # Seed in the foreground before handing over to launchd. In auto mode the
+    # first run can create a lot of lists, and watching it happen beats
+    # discovering it in a log afterwards -- and if it fails, nothing is loaded.
+    if initial_sync and config.sync_reminders:
+        print("running the first sync...")
+        if sync_once(config) != 0:
+            raise UserError(
+                "the first sync reported problems, so the LaunchAgent was not "
+                "installed. Fix them, or re-run with --skip-initial-sync."
+            )
+        print()
+
+    # Before writing the new one: an agent installed under the old label would
+    # otherwise stay loaded and sync the same pairs on its own schedule.
+    drop_legacy_launch_agents()
+
+    if config.sync_reminders:
+        path = install_launch_agent(
+            LAUNCH_LABEL,
+            ["--config", config.path, "sync"],
+            interval,
+            config.log_file,
+        )
+        print("installed %s" % path)
+        print("  syncing every %d seconds" % interval)
+    elif remove_launch_agent(LAUNCH_LABEL):
+        # Switching a feature off has to actually stop it, or the old agent
+        # keeps running on a schedule nobody remembers setting.
+        print("removed the sync agent: reminders are switched off")
+
+    if config.sync_battery:
+        path = install_launch_agent(
+            BATTERY_LAUNCH_LABEL,
+            ["--config", config.path, "battery"],
+            config.battery_interval,
+            config.log_file,
+        )
+        print("installed %s" % path)
+        print("  publishing batteries every %d seconds" % config.battery_interval)
+    elif remove_launch_agent(BATTERY_LAUNCH_LABEL):
+        print("removed the battery agent: batteries are switched off")
+
+    print("log: %s" % config.log_file)
     return 0
 
 
 def cmd_uninstall() -> int:
-    plist_path = launch_agent_path()
-    removed = remove_launch_agent(LAUNCH_LABEL)
-    if removed:
-        print("removed %s" % plist_path)
-    # Uninstall has to mean uninstalled, whichever label the agent went in
-    # under, or an old one keeps syncing after the user thinks it stopped.
-    for label in LEGACY_LAUNCH_LABELS:
+    removed = []
+    for label in (LAUNCH_LABEL, BATTERY_LAUNCH_LABEL) + LEGACY_LAUNCH_LABELS:
+        # Uninstall has to mean uninstalled, whichever label the agent went in
+        # under, or an old one keeps syncing after the user thinks it stopped.
         if remove_launch_agent(label):
-            print("removed %s" % launch_agent_path(label))
-            removed = True
+            removed.append(launch_agent_path(label))
+    for path in removed:
+        print("removed %s" % path)
     if not removed:
-        print("nothing to remove at %s" % plist_path)
+        print("nothing to remove at %s" % launch_agent_path())
     return 0
 
 
@@ -2168,6 +3303,17 @@ def build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--token", help="skip the question and use this token")
     setup.add_argument("--interval", type=int, default=600, help="seconds between syncs")
     setup.add_argument(
+        "--features",
+        help="skip the checklist: \"reminders\", \"battery\", both comma-separated, "
+        "or \"none\"",
+    )
+    setup.add_argument(
+        "--battery-interval",
+        type=int,
+        default=300,
+        help="seconds between battery publishes",
+    )
+    setup.add_argument(
         "--reminders-binary", help="path to the `reminders` binary, if it is not on PATH"
     )
     setup.add_argument(
@@ -2188,6 +3334,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="allow a run that deletes more than max_deletes_per_run items",
+    )
+
+    battery = sub.add_parser(
+        "battery", help="publish this Mac's battery sensors to Home Assistant"
+    )
+    battery.add_argument(
+        "--dry-run", action="store_true", help="only print what would be published"
     )
 
     run = sub.add_parser("run", help="sync repeatedly in the foreground")
@@ -2242,6 +3395,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         if command == "sync":
             return sync_once(config, dry_run=args.dry_run, force=args.force)
+        if command == "battery":
+            # Deliberately runs whether or not the feature is switched on:
+            # asking for it by name is asking for it. `features` decides what
+            # gets a LaunchAgent, not what may be run by hand.
+            return publish_batteries(config, dry_run=args.dry_run)
         if command == "run":
             return cmd_run(config, args.interval)
         if command == "doctor":

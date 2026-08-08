@@ -24,7 +24,7 @@ e2e-create: ## Same, but create the RHS test lists in Reminders first
 
 .PHONY: check
 check: test ## Unit tests plus a syntax check of everything
-	$(PYTHON) -m py_compile $(SCRIPT) dev/bootstrap.py dev/formula.py tests/e2e.py tests/test_merge.py
+	$(PYTHON) -m py_compile $(SCRIPT) dev/bootstrap.py dev/formula.py tests/e2e.py tests/test_merge.py tests/test_battery.py
 	@echo "ok"
 
 # --- releasing -------------------------------------------------------------- #

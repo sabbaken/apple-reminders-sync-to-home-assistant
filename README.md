@@ -8,6 +8,11 @@ One small Python script that runs on the Mac every few minutes in the
 background. Your lists are paired up by name and the missing ones created on
 both sides, so there is nothing to configure beyond a token.
 
+It can also publish **battery levels** — this Mac, and every Bluetooth device
+around it: AirPods cell by cell, mouse, keyboard, trackpad — as real Home
+Assistant sensors, each with a charging flag of its own. The two halves are
+independent, and `setup` asks which of them you want.
+
 ## Install
 
 You need [Homebrew](https://brew.sh) and a Home Assistant token.
@@ -34,11 +39,12 @@ reminders-ha-sync setup
 The first command brings `reminders-cli` with it — that is the part that talks
 to the Reminders app. The second one walks through the rest:
 
-1. Asks macOS for permission to read your Reminders — **click Allow**.
-2. Asks for your Home Assistant address and that token, and checks both work
+1. Asks which halves you want: the list sync, the battery sensors, or both.
+2. Asks macOS for permission to read your Reminders — **click Allow**.
+3. Asks for your Home Assistant address and that token, and checks both work
    before writing anything.
-3. Shows you which lists it is about to sync and lets you drop any of them.
-4. Syncs once while you watch, then keeps syncing every 10 minutes.
+4. Shows you which lists it is about to sync and lets you drop any of them.
+5. Syncs once while you watch, then keeps going in the background.
 
 Nothing needs `sudo`, and nothing is written outside your home directory.
 
@@ -47,8 +53,14 @@ Nothing needs `sudo`, and nothing is written outside your home directory.
 
 ```
 $ reminders-ha-sync setup
-Setting up the Reminders <-> Home Assistant sync.
+Setting up reminders-ha-sync.
 Config will be written to /Users/you/.config/reminders-ha-sync/config.json
+
+What should run?
+  up/down move, space toggles, enter accepts
+
+> [x] Reminders sync    two-way sync between Reminders and to-do lists
+  [x] Battery sensors   this Mac, AirPods, and other Bluetooth devices
 
 Reminders: 3 lists (Покупки, Личное, Movies)
 
@@ -69,14 +81,23 @@ Here is what a sync would do:
 Numbers to leave out (comma-separated, Enter to sync all): 3,4
 Excluded: Movies, Shopping List
 
+Battery sensors will be published for:
+  MacBook Pro                    8 sensors
+  Кирилл’s AirPods Pro 3         6 sensors
+  Magic Mouse                    not connected -- will appear once it is
+
 Sync every how many seconds [600]:
-Sync now and start syncing every 600s (Y/n):
+Publish batteries every how many seconds [300]:
+Start now, and sync every 600s and publish batteries every 300s (Y/n):
 
 running the first sync...
 HA +12 ~0 -0 | Reminders +0 ~0 -0 | failures 0
 
 installed /Users/you/Library/LaunchAgents/com.github.sabbaken.reminders-ha-sync.plist
-syncing every 600 seconds; log: /Users/you/Library/Logs/reminders-ha-sync.log
+  syncing every 600 seconds
+installed /Users/you/Library/LaunchAgents/com.github.sabbaken.reminders-ha-sync-battery.plist
+  publishing batteries every 300 seconds
+log: /Users/you/Library/Logs/reminders-ha-sync.log
 
 Done. Check on it any time with:
     reminders-ha-sync doctor
@@ -98,16 +119,23 @@ is nothing to restart.
 ## Everyday use
 
 ```sh
-reminders-ha-sync doctor          # is everything healthy, and what pairs with what
-reminders-ha-sync sync --dry-run  # what would change, without changing it
-reminders-ha-sync sync            # sync now
-reminders-ha-sync setup           # change the address, token or list selection
-reminders-ha-sync uninstall       # stop syncing
+reminders-ha-sync doctor             # is everything healthy, and what pairs with what
+reminders-ha-sync sync --dry-run     # what would change, without changing it
+reminders-ha-sync sync               # sync now
+reminders-ha-sync battery --dry-run  # what the batteries read right now
+reminders-ha-sync battery            # publish them now
+reminders-ha-sync setup              # change the address, token, features or lists
+reminders-ha-sync uninstall          # stop everything
 ```
 
-Syncs happen every 10 minutes, plus one at login. The log is
-`~/Library/Logs/reminders-ha-sync.log`, rotated at 2 MB. To sync more or less
-often, `reminders-ha-sync install --interval 300`.
+Syncs happen every 10 minutes and batteries every 5, plus one of each at login.
+The log is `~/Library/Logs/reminders-ha-sync.log`, rotated at 2 MB. To sync more
+or less often, `reminders-ha-sync install --interval 300`; the battery interval
+lives in the config, as `battery.interval`.
+
+The two run as separate LaunchAgents on separate schedules, which is deliberate:
+the Reminders permission breaks on its own every so often (see below), and there
+is no reason for that to stop the battery sensors as well.
 
 To remove it completely: `reminders-ha-sync uninstall`, then
 `brew uninstall reminders-ha-sync` and delete `~/.config/reminders-ha-sync/`.
@@ -129,6 +157,8 @@ JSON if you would rather edit it. Only the address and token are required.
 | `home_assistant.token` | — | Long-lived token. `RHS_HA_TOKEN` overrides it |
 | `home_assistant.timeout` | `20` | Per-request timeout in seconds |
 | `home_assistant.verify_tls` | `true` | Set false for a self-signed certificate |
+| `features.reminders` | `true` | Sync the to-do lists |
+| `features.battery` | `false` | Publish battery sensors |
 | `lists` | `"auto"` | `"auto"`, or explicit `[{"reminders": …, "ha": …}]` pairs |
 | `exclude` | `[]` | Lists to leave alone, by either side's name or entity id |
 | `create_missing` | `"both"` | `both`, `ha`, `reminders` or `none` |
@@ -141,6 +171,9 @@ JSON if you would rather edit it. Only the address and token are required.
 | `state_file` | `~/.local/state/reminders-ha-sync/state.json` | |
 | `log_file` | `~/Library/Logs/reminders-ha-sync.log` | |
 | `reminders_binary` | auto | Override the `reminders` path |
+| `battery.interval` | `300` | Seconds between battery publishes |
+| `battery.exclude` | `[]` | Devices to leave alone, by the name macOS shows |
+| `battery.state_file` | `~/.local/state/reminders-ha-sync/batteries.json` | |
 
 `config.full-example.json` has all of it with the defaults filled in.
 
@@ -248,6 +281,65 @@ Both trade a rare limitation for a worse install.
 If it ever becomes worth it, the `Reminders` class is the only thing that would
 change: seven methods, and the merge engine knows nothing about it.
 
+## Battery sensors
+
+Switched on during `setup`, or by setting `features.battery` to `true`. Each
+physical device becomes a device in Home Assistant of its own, so AirPods get
+their own card rather than being strays on the Mac's.
+
+For the Mac, from `ioreg`:
+
+| Entity | |
+| --- | --- |
+| `sensor.<mac>_battery_level` | charge, `%` |
+| `binary_sensor.<mac>_battery_charging` | |
+| `binary_sensor.<mac>_ac_connected` | on mains, charging or not |
+| `binary_sensor.<mac>_battery_full` | diagnostic |
+| `sensor.<mac>_battery_health` | the "Maximum Capacity" figure, `%` |
+| `sensor.<mac>_battery_cycles` | diagnostic |
+| `sensor.<mac>_battery_temperature` | `°C`, diagnostic |
+| `sensor.<mac>_battery_time_remaining` | minutes to empty or full, diagnostic |
+
+For every Bluetooth device that reports a battery, a level and a charging flag
+per cell — AirPods report `left`, `right` and `case` separately, a mouse just
+one. The five diagnostic entities are tucked into the device's diagnostic
+section rather than shown alongside the rest.
+
+Sensors are created through the same REST API the official companion app uses,
+so they are real entities: unique ids, renameable in the UI, and they survive a
+restart of Home Assistant with their values intact. The webhook ids this hands
+back live in `~/.local/state/reminders-ha-sync/batteries.json`, mode `600`,
+because anyone holding one can write states into your Home Assistant. Deleting a
+device in Home Assistant is honoured and then undone: the next run notices and
+registers it again. Delete it for good by switching the feature off first.
+
+Registering also creates a `device_tracker` entity per device, always `unknown`.
+That comes with the integration and there is no way to decline it; hide it if it
+bothers you.
+
+**What it cannot do:**
+
+**iPhone and Apple Watch are not available from a Mac.** They only report a
+battery over Bluetooth while actually connected to it, which iPhones normally
+are not — macOS's own Batteries widget does not show them either. Install the
+[Home Assistant companion app](https://companion.home-assistant.io) on the
+phone: it publishes its own battery, and the Watch's, and does it far better
+than anything here could. Should a phone ever be connected over Bluetooth, this
+picks it up with no changes.
+
+**Charging is not always knowable for accessories.** macOS splits the
+information in two: `system_profiler` names the devices and gives their levels,
+`pmset` knows which cells are charging but names none of them, and nothing has
+both. They are joined on the percentage, so a cell `pmset` does not list — the
+right earbud, often — or two cells sitting on the same percentage come out
+`unavailable` rather than guessed. The levels themselves are always exact.
+
+**Disconnected devices report nothing rather than something stale.** macOS keeps
+the last reading indefinitely, so a case that has been in a drawer for a month
+still says 62%. Those go out as `unavailable`, and a device that has never been
+seen connected is not registered at all — otherwise every accessory ever paired
+with the Mac would become a card of dead sensors.
+
 ## Development
 
 ```
@@ -257,6 +349,7 @@ config.example.json            the minimum: a URL and a token
 config.full-example.json       every option, with its default
 docker-compose.yml + dev/      throwaway HA on :8124 for testing
 tests/test_merge.py            merge-engine and pairing unit tests (nothing live)
+tests/test_battery.py          battery parsing and publishing, over recorded output
 tests/e2e.py                   real round trips against the dev HA
 ```
 

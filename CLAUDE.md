@@ -26,10 +26,17 @@ Reminders is reached through [keith/reminders-cli](https://github.com/keith/remi
 API with a long-lived admin token. Config is a URL and a token — lists are
 paired by name and the missing ones created on both sides.
 
+A second, independent feature publishes **battery levels** — the Mac and every
+Bluetooth device that reports one — as Home Assistant sensors, via the
+`mobile_app` REST API the official companion app uses. `features` in the config
+switches each half on and off; they get a LaunchAgent each, on purpose (rule
+40). The battery side shares only the config, the logger and the HTTP client
+with the sync: no state, no ordering, no failure mode.
+
 ## Commands
 
 ```bash
-make test                            # 63 unit tests: merge engine + pairing. Nothing live.
+make test                            # 156 unit tests: merge engine, pairing, batteries. Nothing live.
 make check                           # test + py_compile everything
 make e2e                             # 22 real round trips. Needs Reminders access.
 make e2e-create                      # same, creating the RHS test lists first
@@ -46,6 +53,20 @@ A single unit test, any of these:
 /usr/bin/python3 tests/test_merge.py DueFromHaTest.test_recreate_rebuilds_the_reminder
 /usr/bin/python3 -m unittest tests.test_merge.MergeTest
 ```
+
+The battery side, which needs no Reminders access and writes nothing until the
+last step:
+
+```bash
+RHS_CONFIG=/tmp/rhs.json ./reminders_ha_sync.py battery --dry-run
+RHS_CONFIG=/tmp/rhs.json ./reminders_ha_sync.py --verbose battery
+```
+
+`battery` deliberately runs whether or not `features.battery` is set: naming it
+is asking for it. But it *registers devices in whatever Home Assistant the
+config names*, so point `RHS_CONFIG` at a scratch config with a dev URL — and
+give it its own `battery.state_file`, or a real run afterwards finds webhook ids
+belonging to the container and re-registers everything.
 
 **Never run `tests/e2e.py` directly.** Dev access tokens live 30 minutes and
 `make` re-mints one on every target; run the script on its own and it fails with
@@ -79,7 +100,9 @@ reminders_ha_sync.py     everything, in banner-commented sections — grep for t
                            item model                normalizers; the two sides made comparable
                            config                    Config validates, nothing else does
                            Reminders side            the reminders-cli wrapper
-                           Home Assistant side       the REST client
+                           Home Assistant side       the REST client, plus the mobile_app calls
+                           battery: reading macOS    collectors and their pure parsers
+                           battery: publishing       BatteryStore, publish_batteries
                            state                     Store, over state.json
                            planning                  plan_pair, merge_link — pure, no I/O
                            execution                 execute_plan — all the I/O
@@ -92,6 +115,8 @@ dev/formula.py           prints the formula for a pushed tag, with its sha256
 config.example.json      the whole config: url + token
 config.full-example.json every option with its default
 tests/test_merge.py      the pure layers, with FakeReminders/FakeHa for pairing
+tests/test_battery.py    the battery parsers over recorded ioreg/system_profiler/pmset
+                         output, plus publishing against a FakeHa
 tests/e2e.py             scenario list at the bottom; each one resets both sides first
 dev/bootstrap.py         walks HA's onboarding API, creates the test lists, writes dev/config.json
 dev/ha-config/           only configuration.yaml is committed; the container generates the rest
@@ -252,6 +277,63 @@ reminders. Everything here follows:
     not be able to empty both sides; exceeding it fails the pair and asks for
     `--force`.
 
+### Batteries
+
+macOS splits the battery picture across three commands and none of them is
+complete. Everything here is downstream of that.
+
+34. **A reading that stops arriving must be blanked, not left behind.** An
+    AirPods case is only in the Bluetooth data while the lid is open, so a
+    sensor registered yesterday can have no reading today — and would sit at
+    62% forever. `stale_payloads` sends `unavailable` for every registered
+    sensor missing from this run's readings, which is why the store keeps
+    `sensors` as `unique_id -> kind`: by then there is no `Reading` left to ask
+    what kind it was.
+35. **A disconnected accessory reports `unavailable`, never its last value.**
+    macOS keeps stale levels indefinitely. `BatteryDevice.to_publish` blanks
+    them, and `available` is what says so — it is not derived from the numbers,
+    because the numbers look perfectly current.
+36. **A device never seen connected is not registered at all.** Otherwise every
+    accessory ever paired with this Mac becomes a card of dead sensors. It gets
+    picked up the first run it is actually there.
+37. **Accessory charging is joined on the percentage, and may be unknowable.**
+    `system_profiler` names devices and gives levels but not charging; `pmset -g
+    accps` gives charging but no names; `ioreg` has no `BatteryPercent` for
+    these at all. Nothing has both. So `parse_accessory_charging` maps
+    percentage to charging, a repeated percentage maps to None, and a cell
+    pmset omits entirely — the right earbud, routinely — stays `unavailable`.
+    Do not replace this with a guess; the levels are exact and the flag is not.
+38. **`InternalBattery` must stay out of that map.** It is on the same list and
+    it is the Mac, whose charging state would then be attributed to any
+    accessory sitting on the same percentage.
+39. **`CurrentCapacity` is a percentage on Apple silicon and mAh on Intel.**
+    `MaxCapacity` is pinned at 100 on the former, so dividing whenever it is not
+    100 covers both. Taking it at face value on an Intel Mac publishes 2500%.
+    Health is `NominalChargeCapacity / DesignCapacity` — the figure System
+    Settings shows; `AppleRawMaxCapacity` is a percentage point or two lower and
+    is only the fallback.
+40. **Batteries get their own LaunchAgent.** The Reminders grant breaks on its
+    own schedule (rule 25) and there is no reason for that to take the sensors
+    down too. `BATTERY_LAUNCH_LABEL` is subject to rule 27 like any other label.
+41. **A missing `features` means reminders on, batteries off.** Every config
+    written before this existed says nothing, and an upgrade that started
+    registering devices in someone's Home Assistant unasked would be a nasty
+    surprise. `setup` offers both only for a config that does not exist yet.
+42. **Webhook ids are credentials.** Anyone holding one can write states into
+    that Home Assistant, so `batteries.json` is written `0600`. It is a separate
+    file from `state.json` deliberately: losing a registration costs a
+    re-register, and it must never be able to cost anyone their to-do links.
+43. **`not_registered` is answered per sensor, not by failing the call.** A
+    deleted entity or a restored backup comes back that way inside a 200, and
+    `publish_device` re-registers and retries in the same run. A whole
+    registration disappearing is `MobileAppGone` (410, or 404 on some versions)
+    and gets the same treatment one level up.
+44. **iPhone and Apple Watch cannot be read from a Mac.** They report a battery
+    over Bluetooth only while connected to it, which they are not — the Batteries
+    widget does not show them either. The companion app on the phone is the
+    answer, and the collector is generic, so a phone that *is* connected appears
+    with no code change. Do not add a special case for it.
+
 ## Testing this thing safely
 
 `tests/e2e.py` **empties the list it points at**, on both sides, before each
@@ -271,6 +353,13 @@ removed by hand in Reminders.app.
 
 The dev container is on **:8124**, not 8123, so it can run beside a real
 instance.
+
+Publishing batteries against it is safe and leaves two things behind: a
+`mobile_app` config entry per device, and a `device_tracker` entity per
+registration that the integration creates on its own and that stays `unknown`
+forever. Neither affects `make e2e`, which only touches to-do entities. Delete
+the config entries in the UI if they are in the way — the next publish will
+notice and register again, which is rule 43 doing its job.
 
 ## Permissions, and paths not taken
 

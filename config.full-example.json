@@ -6,6 +6,11 @@
     "verify_tls": true
   },
 
+  "features": {
+    "reminders": true,
+    "battery": false
+  },
+
   "lists": "auto",
   "exclude": ["Movies", "todo.shopping_list"],
   "create_missing": "both",
@@ -15,5 +20,10 @@
   "due_from_ha": "revert",
   "match_by_title": true,
   "max_deletes_per_run": 25,
-  "log_level": "info"
+  "log_level": "info",
+
+  "battery": {
+    "interval": 300,
+    "exclude": ["Magic Mouse"]
+  }
 }
