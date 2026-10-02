@@ -1,0 +1,11 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Apple Calendar Sync",
+        "description": "Receive all calendars from your Mac. Enable the calendar feature in reminders-ha-sync on the Mac and publish with your Home Assistant administrator token."
+      }
+    },
+    "abort": {"already_configured": "Apple Calendar Sync is already configured."}
+  }
+}

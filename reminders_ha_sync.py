@@ -62,6 +62,7 @@ LAUNCH_LABEL = "com.github.sabbaken.reminders-ha-sync"
 # reminders-cli` re-signs the binary out from under TCC, see `signature_check`
 # -- and there is no reason for that to take the battery sensors down too.
 BATTERY_LAUNCH_LABEL = "com.github.sabbaken.reminders-ha-sync-battery"
+CALENDAR_LAUNCH_LABEL = "com.github.sabbaken.reminders-ha-sync-calendar"
 
 # Labels this agent used to install under. They have to be booted out and
 # deleted on the way past, or an upgrade leaves the old agent loaded alongside
@@ -338,14 +339,34 @@ class Config:
                 "%s: \"features\" must be an object like "
                 "{\"reminders\": true, \"battery\": true}" % path
             )
-        unknown = sorted(set(features) - {"reminders", "battery"})
+        unknown = sorted(set(features) - {"reminders", "battery", "calendar"})
         if unknown:
             raise UserError(
-                "%s: unknown feature %s -- only \"reminders\" and \"battery\" "
+                "%s: unknown feature %s -- only \"reminders\", \"battery\" and \"calendar\" "
                 "exist" % (path, ", ".join(repr(name) for name in unknown))
             )
         self.sync_reminders = bool(features.get("reminders", True))
         self.sync_battery = bool(features.get("battery", False))
+        self.sync_calendar = bool(features.get("calendar", False))
+        calendar = raw.get("calendar", {})
+        if not isinstance(calendar, dict):
+            raise UserError("%s: calendar must be an object" % path)
+        self.calendar_interval = calendar.get("interval", 300)
+        self.calendar_past_days = calendar.get("past_days", 365)
+        self.calendar_future_days = calendar.get("future_days", 730)
+        for name, value, minimum in (
+            ("interval", self.calendar_interval, 30),
+            ("past_days", self.calendar_past_days, 0),
+            ("future_days", self.calendar_future_days, 1),
+        ):
+            if type(value) is not int or value < minimum:
+                raise UserError("%s: calendar.%s must be an integer >= %d" % (path, name, minimum))
+        if self.calendar_past_days + self.calendar_future_days > 1460:
+            raise UserError("calendar range cannot exceed four years (1460 days)")
+        self.calendar_binary = calendar.get("binary") or None
+        self.calendar_source_id = calendar.get("source_id") or None
+        if self.calendar_source_id is not None and not isinstance(self.calendar_source_id, str):
+            raise UserError("calendar.source_id must be a string")
 
         battery = raw.get("battery", {})
         if not isinstance(battery, dict):
@@ -384,6 +405,68 @@ def load_config(path: str) -> Config:
     if not isinstance(raw, dict):
         raise UserError("%s must contain a JSON object" % full)
     return Config(raw, full)
+
+
+# --------------------------------------------------------------------------- #
+# Calendars: read EventKit through the optional native helper, publish snapshots
+# --------------------------------------------------------------------------- #
+
+
+def calendar_binary(config: Config) -> str:
+    if config.calendar_binary:
+        candidates = [expand(str(config.calendar_binary))]
+    else:
+        root = os.path.dirname(SCRIPT_PATH)
+        candidates = [
+            # SCRIPT_PATH keeps Homebrew's bin symlink. The opt symlink points
+            # to this formula's current libexec and survives upgrades too.
+            os.path.join(root, "..", "opt", "reminders-ha-sync", "libexec", "Apple Calendar Sync.app", "Contents", "MacOS", "CalendarExport"),
+            os.path.join(root, "..", "libexec", "Apple Calendar Sync.app", "Contents", "MacOS", "CalendarExport"),
+            os.path.join(root, "build", "Apple Calendar Sync.app", "Contents", "MacOS", "CalendarExport"),
+        ]
+    for candidate in candidates:
+        if os.access(candidate, os.X_OK):
+            return os.path.abspath(candidate)
+    raise UserError("Calendar helper not found. Run `make calendar-helper`, or set calendar.binary to CalendarExport inside the built app bundle.")
+
+
+def collect_calendars(config: Config) -> dict:
+    try:
+        result = subprocess.run(
+            [calendar_binary(config), str(config.calendar_past_days), str(config.calendar_future_days)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise UserError("cannot read calendars: %s" % exc) from None
+    if result.returncode:
+        raise UserError("Calendar helper: %s" % result.stderr.strip())
+    try:
+        payload = json.loads(result.stdout)
+    except ValueError:
+        raise UserError("Calendar helper returned invalid JSON; no snapshot was published") from None
+    if not isinstance(payload, dict) or payload.get("version") != 1 or not payload.get("calendars"):
+        raise UserError("Calendar helper returned no calendars or an unsupported snapshot; nothing was published")
+    if config.calendar_source_id:
+        payload["source_id"] = config.calendar_source_id
+    return payload
+
+
+def publish_calendars(config: Config, dry_run: bool = False) -> int:
+    payload = collect_calendars(config)
+    for calendar in payload["calendars"]:
+        print("  %s (%s): %d events" % (calendar["name"], calendar["source"], len(calendar["events"])))
+    if dry_run:
+        print("Dry run: no data sent to Home Assistant.")
+        return 0
+    ha = HomeAssistant(config.ha_url, config.ha_token, config.ha_timeout, config.ha_verify_tls)
+    try:
+        ha._request("POST", "/api/apple_calendar_sync/snapshot", payload)
+    except UserError as exc:
+        if "returned 404" in str(exc) or "returned 503" in str(exc):
+            raise UserError("Install custom_components/apple_calendar_sync in Home Assistant, restart it, and add Apple Calendar Sync under Devices & services first.") from None
+        raise
+    LOG.info("Published %d calendars", len(payload["calendars"]))
+    return 0
 
 
 # --------------------------------------------------------------------------- #
@@ -2450,7 +2533,7 @@ def cmd_doctor(config: Config) -> int:
 
     enabled = [
         name
-        for name, on in (("reminders", config.sync_reminders), ("battery", config.sync_battery))
+        for name, on in (("reminders", config.sync_reminders), ("battery", config.sync_battery), ("calendar", config.sync_calendar))
         if on
     ]
     print("version     %s" % VERSION)
@@ -2531,6 +2614,21 @@ def cmd_doctor(config: Config) -> int:
             "state       %s: %d links, last sync %s"
             % (key, len(state.get("links", [])), state.get("last_sync") or "never")
         )
+
+    if config.sync_calendar:
+        print()
+        try:
+            binary = calendar_binary(config)
+            signed, detail = signature_check(binary)
+            check("calendar helper signature", signed, detail)
+            snapshot = collect_calendars(config)
+            check("Calendar access", True, "%d calendars" % len(snapshot["calendars"]))
+            entries = ha._request("GET", "/api/config/config_entries/entry?domain=apple_calendar_sync")
+            check("HA calendar receiver", bool(entries), "Apple Calendar Sync integration")
+        except UserError as exc:
+            check("calendars", False, str(exc).splitlines()[0])
+        path = launch_agent_path(CALENDAR_LAUNCH_LABEL)
+        check("calendar agent", os.path.exists(path), path)
 
     if config.sync_battery:
         print()
@@ -2836,16 +2934,16 @@ def wait_for_reminders_access(reminders: Reminders) -> List[str]:
                 ) from None
 
 
-def parse_features(value: str) -> Tuple[bool, bool]:
-    """`--features reminders,battery` -> (True, True). "none" turns both off."""
+def parse_features(value: str) -> Tuple[bool, bool, bool]:
+    """Return reminders, battery and calendar selections; "none" turns all off."""
     names = {chunk.strip().lower() for chunk in value.split(",") if chunk.strip()}
-    unknown = sorted(names - {"reminders", "battery", "none"})
+    unknown = sorted(names - {"reminders", "battery", "calendar", "none"})
     if unknown:
         raise UserError(
-            "unknown feature %s -- expected \"reminders\", \"battery\" or both"
+            "unknown feature %s -- expected \"reminders\", \"battery\" or \"calendar\""
             % ", ".join(repr(name) for name in unknown)
         )
-    return "reminders" in names, "battery" in names
+    return "reminders" in names, "battery" in names, "calendar" in names
 
 
 def cmd_setup(config_path: str, args: argparse.Namespace) -> int:
@@ -2869,23 +2967,25 @@ def cmd_setup(config_path: str, args: argparse.Namespace) -> int:
     stored = stored if isinstance(stored, dict) else {}
     want_reminders = bool(stored.get("reminders", True))
     want_battery = bool(stored.get("battery", False))
+    want_calendar = bool(stored.get("calendar", False))
 
     if args.features is not None:
-        want_reminders, want_battery = parse_features(args.features)
+        want_reminders, want_battery, want_calendar = parse_features(args.features)
     elif not args.yes:
-        want_reminders, want_battery = ask_checklist(
+        want_reminders, want_battery, want_calendar = ask_checklist(
             "What should run?",
             (
                 ("Reminders sync", "two-way sync between Reminders and to-do lists"),
                 ("Battery sensors", "this Mac, AirPods, and other Bluetooth devices"),
+                ("Calendar sync", "all Calendar accounts to Home Assistant; requires the HA receiver"),
             ),
             # A config that does not exist yet offers both. One that does
             # offers back exactly what it already says, so re-running setup
             # can never switch something on behind the user's back.
-            [want_reminders, True if not existing else want_battery],
+            [want_reminders, True if not existing else want_battery, want_calendar],
         )
 
-    if not want_reminders and not want_battery:
+    if not want_reminders and not want_battery and not want_calendar:
         raise UserError(
             "nothing was selected, so there is nothing to set up. Pick at "
             "least one."
@@ -2950,7 +3050,7 @@ def cmd_setup(config_path: str, args: argparse.Namespace) -> int:
 
     raw = dict(existing)
     raw["home_assistant"] = dict(previous, url=url.rstrip("/"), token=token)
-    raw["features"] = {"reminders": want_reminders, "battery": want_battery}
+    raw["features"] = {"reminders": want_reminders, "battery": want_battery, "calendar": want_calendar}
     write_config(full_path, raw)
 
     # -- show the plan, offer to trim it ----------------------------------- #
@@ -3025,6 +3125,12 @@ def cmd_setup(config_path: str, args: argparse.Namespace) -> int:
             print("! Nothing on this Mac reports a battery.")
         print()
 
+    if want_calendar:
+        print("Calendars (macOS to Home Assistant):")
+        publish_calendars(config, dry_run=True)
+        print("Install and add the Apple Calendar Sync integration in Home Assistant before publishing.")
+        print()
+
     # -- background it ----------------------------------------------------- #
 
     interval = args.interval
@@ -3054,6 +3160,8 @@ def cmd_setup(config_path: str, args: argparse.Namespace) -> int:
             print("    %s sync --dry-run" % SCRIPT_PATH)
         if want_battery:
             print("    %s battery --dry-run" % SCRIPT_PATH)
+        if want_calendar:
+            print("    %s calendar --dry-run" % SCRIPT_PATH)
         return 0
 
     if args.no_install:
@@ -3065,11 +3173,15 @@ def cmd_setup(config_path: str, args: argparse.Namespace) -> int:
             print("Publishing batteries once, without installing the LaunchAgent...")
             result = publish_batteries(config) or result
         print()
+        if want_calendar:
+            result = publish_calendars(config) or result
         print("From now on, run:")
         if want_reminders:
             print("    %s sync" % SCRIPT_PATH)
         if want_battery:
             print("    %s battery" % SCRIPT_PATH)
+        if want_calendar:
+            print("    %s calendar" % SCRIPT_PATH)
         return result
 
     schedule = []
@@ -3077,6 +3189,9 @@ def cmd_setup(config_path: str, args: argparse.Namespace) -> int:
         schedule.append("sync every %ds" % interval)
     if want_battery:
         schedule.append("publish batteries every %ds" % battery_interval)
+
+    if want_calendar:
+        schedule.append("publish calendars every %ds" % config.calendar_interval)
 
     if not args.yes and not confirm("Start now, and " + " and ".join(schedule)):
         print()
@@ -3170,9 +3285,9 @@ def install_launch_agent(
 
 
 def cmd_install(config: Config, interval: int, initial_sync: bool = True) -> int:
-    if not config.sync_reminders and not config.sync_battery:
+    if not config.sync_reminders and not config.sync_battery and not config.sync_calendar:
         raise UserError(
-            "both features are switched off in %s, so there is nothing to "
+            "all features are switched off in %s, so there is nothing to "
             "install. Enable one under \"features\", or re-run `%s setup`."
             % (config.path, os.path.basename(SCRIPT_PATH))
         )
@@ -3188,6 +3303,9 @@ def cmd_install(config: Config, interval: int, initial_sync: bool = True) -> int
                 "installed. Fix them, or re-run with --skip-initial-sync."
             )
         print()
+
+    if initial_sync and config.sync_calendar:
+        publish_calendars(config)
 
     # Before writing the new one: an agent installed under the old label would
     # otherwise stay loaded and sync the same pairs on its own schedule.
@@ -3219,13 +3337,20 @@ def cmd_install(config: Config, interval: int, initial_sync: bool = True) -> int
     elif remove_launch_agent(BATTERY_LAUNCH_LABEL):
         print("removed the battery agent: batteries are switched off")
 
+    if config.sync_calendar:
+        path = install_launch_agent(CALENDAR_LAUNCH_LABEL, ["--config", config.path, "calendar"],
+                                   config.calendar_interval, config.log_file)
+        print("installed %s" % path)
+    elif remove_launch_agent(CALENDAR_LAUNCH_LABEL):
+        print("removed the calendar agent: calendars are switched off")
+
     print("log: %s" % config.log_file)
     return 0
 
 
 def cmd_uninstall() -> int:
     removed = []
-    for label in (LAUNCH_LABEL, BATTERY_LAUNCH_LABEL) + LEGACY_LAUNCH_LABELS:
+    for label in (LAUNCH_LABEL, BATTERY_LAUNCH_LABEL, CALENDAR_LAUNCH_LABEL) + LEGACY_LAUNCH_LABELS:
         # Uninstall has to mean uninstalled, whichever label the agent went in
         # under, or an old one keeps syncing after the user thinks it stopped.
         if remove_launch_agent(label):
@@ -3325,7 +3450,7 @@ def build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--interval", type=int, default=600, help="seconds between syncs")
     setup.add_argument(
         "--features",
-        help="skip the checklist: \"reminders\", \"battery\", both comma-separated, "
+        help="skip the checklist: reminders, battery, calendar (comma-separated), "
         "or \"none\"",
     )
     setup.add_argument(
@@ -3363,6 +3488,9 @@ def build_parser() -> argparse.ArgumentParser:
     battery.add_argument(
         "--dry-run", action="store_true", help="only print what would be published"
     )
+
+    calendar = sub.add_parser("calendar", help="publish all macOS calendars to Home Assistant")
+    calendar.add_argument("--dry-run", action="store_true", help="read calendars without sending data")
 
     run = sub.add_parser("run", help="sync repeatedly in the foreground")
     run.add_argument("--interval", type=int, default=600, help="seconds between syncs")
@@ -3421,6 +3549,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # asking for it by name is asking for it. `features` decides what
             # gets a LaunchAgent, not what may be run by hand.
             return publish_batteries(config, dry_run=args.dry_run)
+        if command == "calendar":
+            return publish_calendars(config, dry_run=args.dry_run)
         if command == "run":
             return cmd_run(config, args.interval)
         if command == "doctor":

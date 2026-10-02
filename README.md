@@ -10,8 +10,9 @@ both sides, so there is nothing to configure beyond a token.
 
 It can also publish **battery levels** — this Mac, and every Bluetooth device
 around it: AirPods cell by cell, mouse, keyboard, trackpad — as real Home
-Assistant sensors, each with a charging flag of its own. The two halves are
-independent, and `setup` asks which of them you want.
+Assistant sensors, each with a charging flag of its own. It can also publish
+all macOS calendars through one Home Assistant integration (see [Calendars](#calendars)).
+The features run independently, and `setup` asks which you want.
 
 ## Install
 
@@ -39,7 +40,7 @@ reminders-ha-sync setup
 The first command brings `reminders-cli` with it — that is the part that talks
 to the Reminders app. The second one walks through the rest:
 
-1. Asks which halves you want: the list sync, the battery sensors, or both.
+1. Asks which features you want: Reminders, batteries and optionally calendars.
 2. Asks macOS for permission to read your Reminders — **click Allow**.
 3. Asks for your Home Assistant address and that token, and checks both work
    before writing anything.
@@ -412,3 +413,85 @@ Users then get it with `brew upgrade`.
 
 [GNU AGPL v3.0 only](LICENSE). If you run a modified version somewhere others
 interact with over a network, the AGPL asks you to offer them its source.
+
+## Calendars
+
+The optional calendar feature publishes **every EventKit calendar on this Mac**
+into Home Assistant through one **Apple Calendar Sync** integration. This includes
+local, iCloud, Google, Exchange and subscribed calendars that macOS exposes to
+EventKit. Add accounts in macOS Calendar first; no provider passwords or OAuth
+setup are needed in this app. The Mac must remain awake and connected for updates.
+
+Each calendar gets its own read-only `calendar` entity, usable in the Calendar
+panel and calendar automations. Names include the account name; calendars with
+identical names remain separate because their native identifiers are used.
+Events retain their title, notes, location, timed start/end and all-day dates.
+EventKit expands recurring events, including modified occurrences, into the
+exported window. Deleted events disappear with the next successful snapshot.
+This is **one-way macOS → Home Assistant**; editing events in HA is not supported.
+Attendees, alarms, attachments, availability and conference metadata are not
+exported as separate fields.
+
+### Set up
+
+1. Copy `custom_components/apple_calendar_sync` from this repository into
+   `<HA config>/custom_components/apple_calendar_sync` on your Home Assistant
+   machine. A Homebrew installation also includes this folder under
+   `$(brew --prefix reminders-ha-sync)/share/reminders-ha-sync/custom_components`.
+2. Restart Home Assistant. In **Settings → Devices & services → Add integration**,
+   add **Apple Calendar Sync** once. That single entry receives all calendars,
+   including new calendars discovered on later runs and calendars from other Macs.
+3. When running from this checkout, run `make calendar-helper` (requires Xcode
+   Command Line Tools). Homebrew builds and installs the helper automatically.
+   It is a signed native app bundle using Apple's EventKit; the Python script
+   still uses only the standard library and `/usr/bin/python3`.
+4. Enable `"calendar": true` alongside your existing feature selections:
+
+   ```json
+   "features": {"reminders": true, "battery": false, "calendar": true},
+   "calendar": {"interval": 300, "past_days": 365, "future_days": 730}
+   ```
+
+5. Run `reminders-ha-sync calendar --dry-run` (or
+   `./reminders_ha_sync.py calendar --dry-run` from the checkout). Allow calendar
+   access when macOS asks. This reads data without sending anything to HA.
+6. Run `reminders-ha-sync calendar` to publish once, then
+   `reminders-ha-sync install --skip-initial-sync` to install the independent
+   calendar LaunchAgent alongside any other enabled agents.
+
+Alternatively, select Calendar sync in `setup`, after installing the HA receiver.
+Use an administrator token for calendar publishing. The receiver accepts the
+same authenticated Home Assistant token already used for Reminders and batteries;
+there is no unauthenticated calendar feed or additional listening server on Mac.
+
+### Range and failures
+
+By default each snapshot covers one year in the past and two years in the future.
+Change `calendar.past_days` and `calendar.future_days` to choose the range; their
+sum cannot exceed 1460 days (EventKit limits queries to four years). Older history
+and occurrences beyond the window are not available in HA. Repeating calendars
+cannot be exported as an infinite set of events.
+
+The receiver stores the last successful snapshot across HA restarts. Failed reads,
+denied access, invalid exports or failed storage writes do not replace it. An empty
+calendar list is rejected to protect against permission failures. A calendar
+removed from macOS becomes unavailable in HA; its entity stays in the registry
+so restoring it retains its identity. After 30 minutes without a successful
+snapshot, entities become unavailable, retaining their cached events. Keep the
+publish interval below 30 minutes. The published range moves forward every run.
+
+`calendar.binary` can point at `CalendarExport` **inside its signed app bundle**.
+`calendar.source_id` overrides the Mac's hardware UUID if needed; keep this value
+stable, since changing it creates a new set of entities. `doctor` checks the
+helper signature, calendar access, receiver registration and LaunchAgent file.
+A helper rebuild or upgrade may require granting calendar access again; use
+**System Settings → Privacy & Security → Calendars** if access fails.
+
+Calendar publishing is disabled for existing configs until explicitly enabled.
+The `calendar` command runs when requested regardless of that flag, like `battery`.
+It shares neither the Reminders state nor the battery registration file.
+
+For receiver development, `make ha-up` copies the integration into the throwaway
+Home Assistant on port 8124. `tests/test_calendar.py` uses synthetic events and
+never requests access to personal calendars. `make calendar-e2e` verifies the
+receiver against that dev instance using synthetic calendars only.

@@ -5,25 +5,34 @@
     "timeout": 20,
     "verify_tls": true
   },
-
   "features": {
     "reminders": true,
-    "battery": false
+    "battery": false,
+    "calendar": false
   },
-
   "lists": "auto",
-  "exclude": ["Movies", "todo.shopping_list"],
+  "exclude": [
+    "Movies",
+    "todo.shopping_list"
+  ],
   "create_missing": "both",
   "reminders_source": null,
-
   "conflict_winner": "reminders",
   "due_from_ha": "revert",
   "match_by_title": true,
   "max_deletes_per_run": 25,
   "log_level": "info",
-
   "battery": {
     "interval": 300,
-    "exclude": ["Magic Mouse"]
+    "exclude": [
+      "Magic Mouse"
+    ]
+  },
+  "calendar": {
+    "interval": 300,
+    "past_days": 365,
+    "future_days": 730,
+    "binary": null,
+    "source_id": null
   }
 }

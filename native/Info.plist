@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>com.github.sabbaken.apple-calendar-sync</string>
+<key>CFBundleName</key><string>Apple Calendar Sync</string>
+<key>CFBundleExecutable</key><string>CalendarExport</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleVersion</key><string>1</string>
+<key>LSUIElement</key><true/>
+<key>NSCalendarsUsageDescription</key><string>Publish calendars and events from this Mac to your Home Assistant.</string>
+<key>NSCalendarsFullAccessUsageDescription</key><string>Read calendars and events from all accounts on this Mac and publish them to your Home Assistant. No calendar data is edited.</string>
+</dict></plist>

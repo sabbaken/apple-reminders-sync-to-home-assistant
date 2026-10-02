@@ -400,3 +400,22 @@ dependency, but needs a second permission (Automation → Reminders) that is
 unreliable under launchd. Both trade a rare limitation for a worse install. If
 this is ever revisited, `Reminders` is the only class that changes — seven
 methods, and the merge engine knows nothing about it.
+
+
+## Calendar publishing
+
+An optional third feature publishes all EventKit calendars one way to HA.
+`native/CalendarExport.swift` is compiled into a signed app bundle by
+`make calendar-helper`; Python remains stdlib-only. The receiver lives in
+`custom_components/apple_calendar_sync` and must be installed and added in HA.
+Each calendar has a real read-only calendar entity; identifiers include the Mac
+hardware UUID and native calendar id, never just titles. EventKit expands
+recurrences within a bounded window (default 365 past / 730 future days).
+
+Calendar publishing has a separate LaunchAgent and no Reminders state. Old
+configs leave it off. Empty calendar reads must fail without publishing. HA
+validates the entire snapshot and persists it before replacing live data. Removed
+calendars and sources silent for 30 minutes become unavailable; cached events stay.
+`calendar --dry-run` reads personal calendars and can request TCC access, but sends
+nothing. Use synthetic snapshots against dev HA on :8124 for receiver testing;
+never publish personal calendar data into the dev instance without explicit intent.

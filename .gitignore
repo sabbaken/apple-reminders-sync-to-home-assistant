@@ -19,3 +19,6 @@ dev/config.json
 # A real config lives in ~/.config/reminders-ha-sync/, but make it hard to
 # commit one by accident.
 config.json
+
+# Optional compiled EventKit helper
+build/

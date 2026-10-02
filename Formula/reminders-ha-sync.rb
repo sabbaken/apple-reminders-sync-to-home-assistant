@@ -33,6 +33,9 @@ class RemindersHaSync < Formula
 
   def install
     bin.install "reminders_ha_sync.py" => "reminders-ha-sync"
+    system "/usr/bin/python3", "dev/build_calendar_helper.py", "--output", "build/Apple Calendar Sync.app"
+    libexec.install "build/Apple Calendar Sync.app"
+    (share/"reminders-ha-sync").install "custom_components"
     # The script is installed on its own, so keep the licence next to it.
     prefix.install "LICENSE"
   end

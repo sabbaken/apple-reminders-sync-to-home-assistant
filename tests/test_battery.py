@@ -687,16 +687,16 @@ class FeaturesConfigTest(unittest.TestCase):
 
 class ParseFeaturesTest(unittest.TestCase):
     def test_both(self):
-        self.assertEqual(rhs.parse_features("reminders,battery"), (True, True))
+        self.assertEqual(rhs.parse_features("reminders,battery"), (True, True, False))
 
     def test_one(self):
-        self.assertEqual(rhs.parse_features("battery"), (False, True))
+        self.assertEqual(rhs.parse_features("battery"), (False, True, False))
 
     def test_none_turns_everything_off(self):
-        self.assertEqual(rhs.parse_features("none"), (False, False))
+        self.assertEqual(rhs.parse_features("none"), (False, False, False))
 
     def test_whitespace_and_case(self):
-        self.assertEqual(rhs.parse_features(" Battery , Reminders "), (True, True))
+        self.assertEqual(rhs.parse_features(" Battery , Reminders "), (True, True, False))
 
     def test_a_typo_is_reported(self):
         with self.assertRaises(rhs.UserError):

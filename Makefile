@@ -24,7 +24,7 @@ e2e-create: ## Same, but create the RHS test lists in Reminders first
 
 .PHONY: check
 check: test ## Unit tests plus a syntax check of everything
-	$(PYTHON) -m py_compile $(SCRIPT) dev/bootstrap.py dev/formula.py tests/e2e.py tests/test_merge.py tests/test_battery.py
+	$(PYTHON) -m py_compile $(SCRIPT) dev/bootstrap.py dev/formula.py tests/e2e.py tests/test_merge.py tests/test_battery.py tests/test_calendar.py dev/build_calendar_helper.py dev/test_calendar_receiver.py custom_components/apple_calendar_sync/*.py
 	@echo "ok"
 
 # --- releasing -------------------------------------------------------------- #
@@ -38,6 +38,7 @@ formula: ## Print the tap formula for a pushed tag: make formula TAG=v0.1.0
 
 .PHONY: ha-up
 ha-up: ## Start the dev HA on :8124, onboard it, write dev/config.json
+	$(MAKE) calendar-dev-install
 	docker compose up -d
 	$(PYTHON) dev/bootstrap.py
 
@@ -73,3 +74,16 @@ dev-dry-run: ## Show what a sync against the dev HA would change
 .PHONY: dev-doctor
 dev-doctor: ## Check the setup against the dev HA
 	RHS_CONFIG=dev/config.json $(PYTHON) $(SCRIPT) doctor
+
+.PHONY: calendar-helper
+calendar-helper: ## Build the optional signed EventKit calendar reader (needs Xcode CLI tools)
+	$(PYTHON) dev/build_calendar_helper.py
+
+.PHONY: calendar-e2e
+calendar-e2e: ## Test the HA calendar receiver with synthetic events only (dev HA must be running)
+	$(PYTHON) dev/test_calendar_receiver.py
+
+.PHONY: calendar-dev-install
+calendar-dev-install: ## Copy the calendar receiver into the ignored dev HA config
+	mkdir -p dev/ha-config/custom_components
+	cp -R custom_components/apple_calendar_sync dev/ha-config/custom_components/
