@@ -48,7 +48,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 LOG = logging.getLogger("reminders-ha-sync")
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 # abspath, deliberately not realpath. Installed by Homebrew this resolves to
 # /opt/homebrew/bin/reminders-ha-sync -- a symlink that `brew upgrade` repoints
