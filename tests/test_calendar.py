@@ -103,6 +103,33 @@ class CalendarPublishTest(unittest.TestCase):
         rhs.publish_calendars(config())
         ha.return_value._request.assert_called_once_with("POST", "/api/apple_calendar_sync/snapshot", snapshot())
 
+    @patch.object(rhs, "HomeAssistant")
+    @patch.object(rhs, "collect_calendars", return_value=snapshot())
+    def test_missing_receiver_explains_hacs_installation(self, collect, ha):
+        for status in (404, 503):
+            ha.return_value._request.reset_mock()
+            ha.return_value._request.side_effect = rhs.UserError("POST returned %d" % status)
+            with self.subTest(status=status), self.assertRaises(rhs.UserError) as raised:
+                rhs.publish_calendars(config())
+            message = str(raised.exception)
+            self.assertIn("HACS", message)
+            self.assertIn("Custom repositories", message)
+            self.assertIn("https://github.com/sabbaken/apple-reminders-sync-to-home-assistant", message)
+            self.assertIn("type Integration", message)
+            self.assertIn("Restart Home Assistant", message)
+            self.assertIn("Add integration", message)
+            ha.return_value._request.assert_called_once()
+
+    @patch.object(rhs, "HomeAssistant")
+    @patch.object(rhs, "collect_calendars", return_value=snapshot())
+    def test_other_failures_keep_their_original_error(self, collect, ha):
+        for status in (401, 403, 500):
+            error = rhs.UserError("POST returned %d" % status)
+            ha.return_value._request.side_effect = error
+            with self.subTest(status=status), self.assertRaises(rhs.UserError) as raised:
+                rhs.publish_calendars(config())
+            self.assertIs(raised.exception, error)
+
     @patch.object(rhs, "calendar_binary", return_value="/helper")
     @patch.object(rhs.subprocess, "run")
     def test_denied_access_and_empty_reads_do_not_publish(self, run, binary):

@@ -434,10 +434,11 @@ exported as separate fields.
 
 ### Set up
 
-1. Copy `custom_components/apple_calendar_sync` from this repository into
-   `<HA config>/custom_components/apple_calendar_sync` on your Home Assistant
-   machine. A Homebrew installation also includes this folder under
-   `$(brew --prefix reminders-ha-sync)/share/reminders-ha-sync/custom_components`.
+1. In **HACS → menu (three dots) → Custom repositories**, add
+   `https://github.com/sabbaken/apple-reminders-sync-to-home-assistant` with type
+   **Integration**. Find **Apple Calendar Sync** in HACS and download it.
+   HACS installs the Home Assistant calendar receiver; install the Mac publisher
+   separately with Homebrew as described above. This is a custom HACS repository.
 2. Restart Home Assistant. In **Settings → Devices & services → Add integration**,
    add **Apple Calendar Sync** once. That single entry receives all calendars,
    including new calendars discovered on later runs and calendars from other Macs.
@@ -460,6 +461,15 @@ exported as separate fields.
    calendar LaunchAgent alongside any other enabled agents.
 
 Alternatively, select Calendar sync in `setup`, after installing the HA receiver.
+HACS manages subsequent receiver updates. With Docker Compose, keep `/config`
+in a persistent volume or bind mount so installed integrations survive container
+recreation.
+
+For installation without HACS, copy `custom_components/apple_calendar_sync` from
+this repository into `<HA config>/custom_components/apple_calendar_sync`, then
+continue from step 2. A Homebrew installation also includes this folder under
+`$(brew --prefix reminders-ha-sync)/share/reminders-ha-sync/custom_components`.
+
 Use an administrator token for calendar publishing. The receiver accepts the
 same authenticated Home Assistant token already used for Reminders and batteries;
 there is no unauthenticated calendar feed or additional listening server on Mac.

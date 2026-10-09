@@ -48,7 +48,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 LOG = logging.getLogger("reminders-ha-sync")
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 
 # abspath, deliberately not realpath. Installed by Homebrew this resolves to
 # /opt/homebrew/bin/reminders-ha-sync -- a symlink that `brew upgrade` repoints
@@ -63,6 +63,14 @@ LAUNCH_LABEL = "com.github.sabbaken.reminders-ha-sync"
 # -- and there is no reason for that to take the battery sensors down too.
 BATTERY_LAUNCH_LABEL = "com.github.sabbaken.reminders-ha-sync-battery"
 CALENDAR_LAUNCH_LABEL = "com.github.sabbaken.reminders-ha-sync-calendar"
+CALENDAR_INSTALL_HINT = (
+    "In Home Assistant, open HACS > menu (three dots) > Custom repositories. "
+    "Add https://github.com/sabbaken/apple-reminders-sync-to-home-assistant "
+    "with type Integration, then download Apple Calendar Sync in HACS. "
+    "Restart Home Assistant and add Apple Calendar Sync under "
+    "Settings > Devices & services > Add integration. "
+    "Then retry the calendar command or setup."
+)
 
 # Labels this agent used to install under. They have to be booted out and
 # deleted on the way past, or an upgrade leaves the old agent loaded alongside
@@ -463,7 +471,7 @@ def publish_calendars(config: Config, dry_run: bool = False) -> int:
         ha._request("POST", "/api/apple_calendar_sync/snapshot", payload)
     except UserError as exc:
         if "returned 404" in str(exc) or "returned 503" in str(exc):
-            raise UserError("Install custom_components/apple_calendar_sync in Home Assistant, restart it, and add Apple Calendar Sync under Devices & services first.") from None
+            raise UserError("Apple Calendar Sync receiver is not installed or configured. " + CALENDAR_INSTALL_HINT) from None
         raise
     LOG.info("Published %d calendars", len(payload["calendars"]))
     return 0
@@ -2624,7 +2632,8 @@ def cmd_doctor(config: Config) -> int:
             snapshot = collect_calendars(config)
             check("Calendar access", True, "%d calendars" % len(snapshot["calendars"]))
             entries = ha._request("GET", "/api/config/config_entries/entry?domain=apple_calendar_sync")
-            check("HA calendar receiver", bool(entries), "Apple Calendar Sync integration")
+            check("HA calendar receiver", bool(entries),
+                  "Apple Calendar Sync integration" if entries else CALENDAR_INSTALL_HINT)
         except UserError as exc:
             check("calendars", False, str(exc).splitlines()[0])
         path = launch_agent_path(CALENDAR_LAUNCH_LABEL)
@@ -3128,7 +3137,7 @@ def cmd_setup(config_path: str, args: argparse.Namespace) -> int:
     if want_calendar:
         print("Calendars (macOS to Home Assistant):")
         publish_calendars(config, dry_run=True)
-        print("Install and add the Apple Calendar Sync integration in Home Assistant before publishing.")
+        print(CALENDAR_INSTALL_HINT)
         print()
 
     # -- background it ----------------------------------------------------- #
