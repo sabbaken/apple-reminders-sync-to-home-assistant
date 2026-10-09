@@ -13,8 +13,8 @@
 class RemindersHaSync < Formula
   desc "Two-way sync between macOS Reminders and Home Assistant to-do lists"
   homepage "https://github.com/sabbaken/apple-reminders-sync-to-home-assistant"
-  url "https://github.com/sabbaken/apple-reminders-sync-to-home-assistant/archive/refs/tags/v0.4.0.tar.gz"
-  sha256 "b9944fbd78e506a4b97f42203891ef7799515e0810f3b98a4bc0b790247e6dad"
+  url "https://github.com/sabbaken/apple-reminders-sync-to-home-assistant/archive/refs/tags/v0.4.1.tar.gz"
+  sha256 "b74266a0e41987755bb60a05987d9f878b04dca8da77ebef6f511e8848bb5c61"
   license "AGPL-3.0-only"
   head "https://github.com/sabbaken/apple-reminders-sync-to-home-assistant.git", branch: "master"
 
