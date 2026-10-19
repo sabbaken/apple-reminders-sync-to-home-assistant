@@ -3010,8 +3010,11 @@ def cmd_setup(config_path: str, args: argparse.Namespace) -> int:
 
     # -- Home Assistant ---------------------------------------------------- #
 
-    url = args.url or ""
+    url = args.url or (str(previous.get("url") or "") if args.yes else "")
     token = args.token or os.environ.get("RHS_HA_TOKEN") or ""
+    saved_token = str(previous.get("token") or "")
+    saved_url = str(previous.get("url") or "").rstrip("/")
+    attempted_url: Optional[str] = None
     ha: Optional[HomeAssistant] = None
 
     while ha is None:
@@ -3022,13 +3025,24 @@ def cmd_setup(config_path: str, args: argparse.Namespace) -> int:
             )
         if not url.startswith(("http://", "https://")):
             url = "http://" + url
+        url = url.rstrip("/")
+        # Retrying a connection may lead to a different server. Credentials
+        # already tried against one address must not follow that change.
+        if attempted_url is not None and url != attempted_url:
+            token = ""
         if not token:
-            print("Profile -> Security -> Long-lived access tokens -> Create Token.")
-            print("Use an administrator account, so lists can be created for you.")
-            print("(the paste stays hidden)")
-            token = ask_secret("Token")
+            if saved_token and url == saved_url:
+                token = saved_token if args.yes else (
+                    ask_secret("Token (Enter to keep saved token)") or saved_token
+                )
+            else:
+                print("Profile -> Security -> Long-lived access tokens -> Create Token.")
+                print("Use an administrator account, so lists can be created for you.")
+                print("(the paste stays hidden)")
+                token = ask_secret("Token")
 
-        candidate = HomeAssistant(url.rstrip("/"), token)
+        attempted_url = url
+        candidate = HomeAssistant(url, token)
         try:
             candidate.ping()
         except UserError as exc:
@@ -3039,6 +3053,7 @@ def cmd_setup(config_path: str, args: argparse.Namespace) -> int:
                 return 2
             if "rejected the token" in str(exc):
                 token = ""
+                saved_token = ""
             else:
                 url = ""
             continue

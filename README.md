@@ -129,6 +129,11 @@ reminders-ha-sync setup              # change the address, token, features or li
 reminders-ha-sync uninstall          # stop everything
 ```
 
+When re-running `setup` with the same Home Assistant address, press Enter at the
+token prompt to keep the saved token, or paste a replacement. Changing the address
+requires a token for the new server. Use `setup --no-sync` to save settings without
+syncing or installing LaunchAgents.
+
 Syncs happen every 10 minutes and batteries every 5, plus one of each at login.
 The log is `~/Library/Logs/reminders-ha-sync.log`, rotated at 2 MB. To sync more
 or less often, `reminders-ha-sync install --interval 300`; the battery interval
